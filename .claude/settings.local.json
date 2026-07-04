@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/bhaveyjain/.classpass-automation/**)",
+      "Bash(python3 -c \"import json,sys; print\\(list\\(json.load\\(sys.stdin\\).keys\\(\\)\\)\\)\")",
+      "Read(//Users/bhaveyjain/.tmobile-receipt-automation/**)",
+      "Read(//Users/bhaveyjain/**)",
+      "Bash(python3 -c \"import playwright; print\\('playwright ok'\\)\")",
+      "Bash(python3 receipts.py tmobile --month 2026-05)",
+      "mcp__claude-in-chrome__tabs_context_mcp",
+      "Bash(curl -s --max-time 3 http://localhost:9222/json/version)",
+      "Bash(nc -z localhost 9222)"
+    ]
+  }
+}
