@@ -4,6 +4,7 @@
     "name": "Bhavey Jain",
     "email": "bhavey05@gmail.com"
   },
+  "description": "Receipt automation plugins for expense systems like Emburse.",
   "plugins": [
     {
       "name": "receipts",
