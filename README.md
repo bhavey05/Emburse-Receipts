@@ -38,7 +38,9 @@ Chromium) and walks you through configuration:
 Or just ask: *"submit my T-Mobile bill for June to Emburse"*.
 
 Fetching never sends anything; sending always shows you the plan (recipient,
-subject, attachment) and asks for confirmation first.
+subject, attachment) and asks for confirmation first. Every send is logged in
+`~/.claude-receipts/sent.json`, and a repeat send for the same provider/month
+is skipped with a warning — pass `--force` to deliberately resend.
 
 ## Providers
 

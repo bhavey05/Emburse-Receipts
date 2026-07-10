@@ -40,6 +40,7 @@ BASE_DIR = Path(os.environ.get("RECEIPTS_HOME", "~/.claude-receipts")).expanduse
 CONFIG_PATH = BASE_DIR / "config.json"
 RECEIPTS_DIR = BASE_DIR / "receipts"
 CLASSPASS_URL_CACHE = BASE_DIR / "stripe-urls.json"
+SENT_LOG = BASE_DIR / "sent.json"
 KEYCHAIN_SERVICE = "claude-receipts-gmail"
 
 CHROME_PROFILE = Path(
@@ -98,6 +99,24 @@ def get_gmail_app_password() -> str | None:
         stderr=subprocess.DEVNULL,
     )
     return result.stdout.decode().rstrip("\n") if result.returncode == 0 else None
+
+
+# --- Sent log (dedupe: one send per provider/month unless --force) ---
+
+def load_sent_log() -> dict:
+    return json.loads(SENT_LOG.read_text()) if SENT_LOG.exists() else {}
+
+
+def record_sent(provider: str, month: str, pdf_path: Path, send_to: str) -> None:
+    log = load_sent_log()
+    log[f"{provider}/{month}"] = {
+        "sent_at": datetime.now().isoformat(timespec="seconds"),
+        "to": send_to,
+        "pdf": pdf_path.name,
+        "sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+    }
+    SENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    SENT_LOG.write_text(json.dumps(log, indent=2) + "\n")
 
 
 # --- PDF generation (Stripe receipt URLs are public; headless Playwright works) ---
@@ -486,9 +505,18 @@ def fetch(args: argparse.Namespace) -> None:
         else:
             pdfs.append((month, tmobile_pdf(month)))
 
+    sent_log = load_sent_log()
     if args.send:
         for month, pdf_path in pdfs:
+            prior = sent_log.get(f"{args.provider}/{month}")
+            if prior and not args.force:
+                print(
+                    f"SKIPPED {label} {month}: already sent {prior['sent_at']} to {prior['to']}"
+                    " (rerun with --force to resend)"
+                )
+                continue
             send_email(pdf_path, label, month)
+            record_sent(args.provider, month, pdf_path, get_send_to())
     else:
         send_to = get_send_to() or "<unset — run: receipts.py config --send-to ...>"
         print("\nSend plan (rerun with --send to email):")
@@ -496,6 +524,9 @@ def fetch(args: argparse.Namespace) -> None:
             print(f"  - To: {send_to}")
             print(f"    Subject: {label} Receipt - {month_label(month)}")
             print(f"    Attachment: {pdf_path}")
+            prior = sent_log.get(f"{args.provider}/{month}")
+            if prior:
+                print(f"    WARNING: already sent {prior['sent_at']} to {prior['to']} — --send will skip it")
 
 
 def main() -> None:
@@ -514,6 +545,9 @@ def main() -> None:
     fetch_parser.add_argument("--url", help="ClassPass: Stripe receipt URL for --month")
     fetch_parser.add_argument("--pdf", help="Import an already-downloaded PDF for --month")
     fetch_parser.add_argument("--send", action="store_true", help="Email the PDF(s)")
+    fetch_parser.add_argument(
+        "--force", action="store_true", help="Send even if this provider/month was already sent"
+    )
     fetch_parser.set_defaults(func=fetch)
 
     doctor_parser = sub.add_parser("doctor", help="check dependencies and configuration")
