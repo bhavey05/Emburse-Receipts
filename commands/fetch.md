@@ -24,6 +24,6 @@ Provider notes:
   - If Claude-in-Chrome browser tools are available: open https://www.verizon.com/my-bill/ in the user's Chrome, open the bill for the target month, download the PDF, then rerun with `--pdf <downloaded file>`.
   - Otherwise, give the user those steps and ask for the path of the downloaded PDF.
 
-If the script fails because of missing dependencies or config, suggest running `/receipts:setup`.
+If the script fails because of missing dependencies or config, suggest running `/emburse-receipts:setup`.
 
-When done, show the user the saved PDF path and the printed send plan, and mention `/receipts:send` to actually email it. Never print cookie values or credentials.
+When done, show the user the saved PDF path and the printed send plan, and mention `/emburse-receipts:send` to actually email it. Never print cookie values or credentials.

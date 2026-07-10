@@ -7,10 +7,10 @@ emails them to your expense system (e.g. Emburse/Chrome River) via Gmail.
 
 ```
 /plugin marketplace add bhavey05/Emburse-Receipts
-/plugin install receipts@bhavey05
+/plugin install emburse-receipts@emburse
 ```
 
-Then run `/receipts:setup` — it checks dependencies (Python 3.9+, Playwright,
+Then run `/emburse-receipts:setup` — it checks dependencies (Python 3.9+, Playwright,
 Chromium) and walks you through configuration:
 
 - **Destination email** — where receipts get sent (for Emburse this is your
@@ -30,9 +30,9 @@ Chromium) and walks you through configuration:
 ## Use
 
 ```
-/receipts:fetch tmobile            # previous month
-/receipts:fetch classpass 2026-06
-/receipts:send verizon 2026-06     # fetch + confirm + email
+/emburse-receipts:fetch tmobile            # previous month
+/emburse-receipts:fetch classpass 2026-06
+/emburse-receipts:send verizon 2026-06     # fetch + confirm + email
 ```
 
 Or just ask: *"submit my T-Mobile bill for June to Emburse"*.

@@ -1,5 +1,5 @@
 {
-  "name": "receipts",
+  "name": "emburse-receipts",
   "description": "Fetch monthly receipt PDFs (T-Mobile, ClassPass, Verizon) and email them to your expense system (e.g. Emburse) via Gmail.",
   "version": "0.2.0",
   "author": {

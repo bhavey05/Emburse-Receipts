@@ -1,5 +1,5 @@
 {
-  "name": "bhavey05",
+  "name": "emburse",
   "owner": {
     "name": "Bhavey Jain",
     "email": "bhavey05@gmail.com"
@@ -7,7 +7,7 @@
   "description": "Receipt automation plugins for expense systems like Emburse.",
   "plugins": [
     {
-      "name": "receipts",
+      "name": "emburse-receipts",
       "source": ".",
       "description": "Fetch monthly receipt PDFs (T-Mobile, ClassPass, Verizon) and email them to your expense system (e.g. Emburse) via Gmail."
     }

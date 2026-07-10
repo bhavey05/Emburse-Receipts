@@ -15,7 +15,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" config   # show/update confi
 
 - `--month` defaults to the previous month; accepts comma-separated months.
 - Without `--send`, fetch only saves the PDF (under `~/.claude-receipts/receipts/`) and prints the send plan. Always show the user the send plan and get their confirmation before rerunning with `--send` — it emails a financial document externally.
-- If anything fails from missing dependencies or config, run `doctor` and fix what it reports (or point the user at `/receipts:setup`).
+- If anything fails from missing dependencies or config, run `doctor` and fix what it reports (or point the user at `/emburse-receipts:setup`).
 
 ## Providers
 

@@ -36,6 +36,6 @@ Set up the receipts plugin. Work through this checklist, fixing issues as you fi
 
 3. `[warn]` lines are provider-specific (macOS / Chrome profile are only needed for T-Mobile's automatic fetch). Mention them but don't block on them.
 
-4. Re-run the doctor to confirm everything passes, then tell the user they're ready and show an example: `/receipts:fetch tmobile` (or `classpass` / `verizon`).
+4. Re-run the doctor to confirm everything passes, then tell the user they're ready and show an example: `/emburse-receipts:fetch tmobile` (or `classpass` / `verizon`).
 
 Never echo, log, or store the app password yourself, and never print cookie values.
