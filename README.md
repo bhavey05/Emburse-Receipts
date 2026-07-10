@@ -1,57 +1,79 @@
-# Receipt Automation
+# Receipts — a Claude Code plugin
 
-Fetches monthly receipt PDFs and emails them to Emburse
-(`receipt@ca1.chromeriver.com`). Everything lives in `receipts.py`.
+Fetches monthly receipt/bill PDFs (**T-Mobile**, **ClassPass**, **Verizon**) and
+emails them to your expense system (e.g. Emburse/Chrome River) via Gmail.
 
-```bash
-python3 receipts.py <classpass|tmobile> [--month YYYY-MM] [--send]
+## Install
+
+```
+/plugin marketplace add bhavey05/Emburse-Receipts
+/plugin install receipts@bhavey05
 ```
 
-- `--month` defaults to the previous month; accepts comma-separated months.
-- Without `--send`, the script only fetches the PDF and prints the send plan.
-  Add `--send` to actually email Emburse (one email per receipt).
+Then run `/receipts:setup` — it checks dependencies (Python 3.9+, Playwright,
+Chromium) and walks you through configuration:
 
-## T-Mobile
+- **Destination email** — where receipts get sent (for Emburse this is your
+  company's receipt inbox, e.g. `receipt@ca1.chromeriver.com`).
+- **Gmail address + app password** — used to send. Create an app password at
+  https://myaccount.google.com/apppasswords. It's stored in your macOS
+  keychain via a hidden prompt (or set `GMAIL_APP_PASSWORD` in your shell
+  profile) — it never passes through the chat.
 
-Fully automatic, as long as you are logged in to t-mobile.com in Chrome
-(the script reads the local Chrome session's cookies; sessions expire after
-a few weeks — if you get a 401, log in again at
-https://www.t-mobile.com/my-account/dashboard):
+> [!IMPORTANT]
+> Your expense system only accepts receipts emailed from addresses registered
+> on **your** account — mail from an unrecognized sender is silently dropped,
+> and the receipt never appears. For Emburse/Chrome River, the Gmail address
+> you configure here must match your profile email, or be added under
+> Preferences/Settings → Personal Settings → **Alternative Emails**.
 
-```bash
-python3 receipts.py tmobile --month 2026-05
-python3 receipts.py tmobile --month 2026-05 --send
+## Use
+
+```
+/receipts:fetch tmobile            # previous month
+/receipts:fetch classpass 2026-06
+/receipts:send verizon 2026-06     # fetch + confirm + email
 ```
 
-PDFs are stored in `~/.tmobile-receipt-automation/receipts/`.
+Or just ask: *"submit my T-Mobile bill for June to Emburse"*.
 
-## ClassPass
+Fetching never sends anything; sending always shows you the plan (recipient,
+subject, attachment) and asks for confirmation first.
 
-ClassPass blocks automated browsers, so the receipt URL must come from a real
-Chrome session (e.g. via Claude in Chrome):
+## Providers
 
-1. Open https://classpass.com/settings/charges.
-2. Click the charge row for the target month — it opens the Stripe receipt in
-   a new tab.
-3. Copy the `https://pay.stripe.com/receipts/...` URL and run:
+| Provider | How it works |
+|---|---|
+| T-Mobile | Fully automatic (macOS): uses your logged-in Chrome session's cookies to call T-Mobile's bill API and download the PDF. Log in at t-mobile.com in Chrome first. |
+| ClassPass | ClassPass blocks bots, so the first fetch of a month needs the `pay.stripe.com` receipt URL from https://classpass.com/settings/charges (Claude in Chrome can grab it for you). Cached afterwards. |
+| Verizon | No stable API — download the bill PDF from https://www.verizon.com/my-bill/ (Claude in Chrome can do it) and the plugin imports it. |
 
-```bash
-python3 receipts.py classpass --month 2026-05 --url '<stripe_url>'
-python3 receipts.py classpass --month 2026-05 --send
-```
+Any provider also accepts an already-downloaded PDF via `--pdf`.
 
-Stripe URLs are public (token in the URL), so headless Playwright renders the
-PDF fine. URLs are cached in `~/.classpass-automation/stripe-urls.json`;
-PDFs in `~/.classpass-automation/receipts/`. Reruns for a cached month never
-need `--url` again.
-
-## Setup
+## CLI (what the plugin runs under the hood)
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 -m playwright install chromium
+python3 scripts/receipts.py fetch <provider> [--month YYYY-MM] [--url ...] [--pdf ...] [--send]
+python3 scripts/receipts.py doctor
+python3 scripts/receipts.py config [--send-to X] [--gmail-address Y] [--set-app-password] [--show]
 ```
 
-Sending uses Gmail SMTP with `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` from
-`~/.zshrc`. Sending transmits payment details to Emburse, so always review the
-send plan (run without `--send`) before sending.
+PDFs and config live in `~/.claude-receipts/` (override with `RECEIPTS_HOME`).
+
+## Security notes, read before installing
+
+- The T-Mobile fetch **reads your Chrome cookies** (macOS only): it copies the
+  cookie DB, decrypts values locally using the Chrome Safe Storage key from
+  your keychain, and sends them only to `t-mobile.com`. Cookie values are
+  never printed or stored.
+- Your Gmail app password lives in your macOS keychain (service
+  `claude-receipts-gmail`) or the `GMAIL_APP_PASSWORD` env var — never in this
+  repo's files.
+- Sending transmits a financial document to the configured address. Review the
+  send plan before confirming.
+
+## Requirements
+
+macOS (T-Mobile fetch + keychain; other providers work anywhere), Python 3.9+,
+Google Chrome with a logged-in session for the provider, Gmail with 2-Step
+Verification (for app passwords).

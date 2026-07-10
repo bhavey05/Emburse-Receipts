@@ -1,0 +1,13 @@
+{
+  "name": "receipts",
+  "description": "Fetch monthly receipt PDFs (T-Mobile, ClassPass, Verizon) and email them to your expense system (e.g. Emburse) via Gmail.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Bhavey Jain",
+    "email": "bhavey05@gmail.com"
+  },
+  "homepage": "https://github.com/bhavey05/Emburse-Receipts",
+  "repository": "https://github.com/bhavey05/Emburse-Receipts",
+  "license": "MIT",
+  "keywords": ["receipts", "expenses", "emburse", "tmobile", "verizon", "classpass"]
+}

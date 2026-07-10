@@ -1,0 +1,14 @@
+{
+  "name": "bhavey05",
+  "owner": {
+    "name": "Bhavey Jain",
+    "email": "bhavey05@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "receipts",
+      "source": ".",
+      "description": "Fetch monthly receipt PDFs (T-Mobile, ClassPass, Verizon) and email them to your expense system (e.g. Emburse) via Gmail."
+    }
+  ]
+}
