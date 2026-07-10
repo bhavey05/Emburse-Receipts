@@ -1,4 +1,4 @@
-# Receipts — a Claude Code plugin
+# Emburse Receipts — a Claude Code plugin
 
 Fetches monthly receipt/bill PDFs (**T-Mobile**, **ClassPass**, **Verizon**) and
 emails them to your expense system (e.g. Emburse/Chrome River) via Gmail.
