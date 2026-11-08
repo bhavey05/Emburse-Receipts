@@ -18,8 +18,8 @@ If `$1` is `pending` (or the user asks for "everything not submitted yet"), run
    ```
 
    The batch keeps going when one item fails and lists all problems at the end. Resolve
-   them as described in `/emburse-receipts:fetch` (T-Mobile login, ClassPass receipt
-   URLs, Verizon PDF), then rerun until the plan contains everything that's available.
+   them as described in `/emburse-receipts:fetch` (T-Mobile or ClassPass login, Verizon
+   PDF), then rerun until the plan contains everything that's available.
    A month whose bill/charge doesn't exist yet (e.g. the current month) is fine to leave out — say so.
 
 2. Show the user the send plan (recipient, subjects, amounts, attachments) and ask them to

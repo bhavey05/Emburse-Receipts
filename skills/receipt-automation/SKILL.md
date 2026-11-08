@@ -37,13 +37,13 @@ via the keychain; never printed) and calls T-Mobile's bill APIs. A month = the b
 On a session error (401), the user needs to log in at https://www.t-mobile.com/bill/summary in Chrome; wait
 ~30s after login (Chrome flushes cookies to disk periodically) before retrying.
 
-**ClassPass** — blocks bots and its Stripe receipt links expire after a few weeks, so each charge needs a fresh
-`pay.stripe.com/receipts/...` URL from a real Chrome session: open https://classpass.com/settings/charges,
-click each needed charge (it opens the Stripe receipt in a new tab), collect the URLs, then pass them all at
-once: `fetch classpass --url '<u1>' --url '<u2>'`. The script reads each receipt's "Date paid" and files it
-under that month, and refuses receipts that don't match `--month` or whose link has expired. If Claude in
-Chrome tools are available, do these steps yourself in the user's browser — but if ClassPass shows its login
-page, ask the user to log in themselves; never submit a login for them.
+**ClassPass** — automatic on macOS, like T-Mobile: the script uses the logged-in Chrome session's cookies to
+read the charges and their Stripe receipt links from ClassPass's API, then renders each receipt. A month = the
+month the charge was paid; each receipt's "Date paid" is checked. On an expired session, the user needs to log
+in at https://classpass.com/settings/charges in Chrome (never submit a login for them) and wait ~30s. Only if
+the automatic method fails for another reason: collect the `pay.stripe.com/receipts/...` links by clicking
+each charge on that page (Claude in Chrome if available, otherwise ask the user) and pass them with
+`fetch classpass --url '<u1>' --url '<u2>'`.
 
 **Verizon** — no stable API (Verizon shuts down reverse-engineered endpoints). Download the bill PDF from
 https://www.verizon.com/my-bill/ in a real Chrome session (via Claude in Chrome if available, otherwise ask
@@ -65,7 +65,8 @@ Verizon).
 - The app password must not pass through chat: the user sets it via `config --set-app-password` (hidden
   prompt, macOS keychain), or — with their OK — copy it from their shell profile with
   `zsh -ic '... config --set-app-password --from-env'` (the value is never displayed).
-- Always get explicit confirmation before `--send`.
+- Always get explicit confirmation before `--send`. `auto --send` and `schedule install` also email receipts
+  immediately — run them only with the user's explicit OK (`/emburse-receipts:setup` covers this).
 
 ## Troubleshooting
 

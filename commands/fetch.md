@@ -20,16 +20,16 @@ failures and lists every problem at the end:
   it for them with Claude in Chrome if available). Chrome writes cookies to disk periodically,
   so wait ~30 seconds after they log in before retrying. "No bill for <month> yet" means the
   billing cycle hasn't closed.
-- **classpass** — needs a `pay.stripe.com/receipts/...` URL per charge (ClassPass blocks bots;
-  links expire after a few weeks, so always get fresh ones). With Claude in Chrome:
-  1. Open https://classpass.com/settings/charges. If it redirects to login, ask the user to
-     log in themselves (never submit a login form for them), then reload.
-  2. Clicking a charge row opens its Stripe receipt in a new tab — do this for each month
-     needed and collect the URLs (check the tab list for `pay.stripe.com/receipts/` URLs).
-  3. Pass them all in one run: `fetch classpass --url '<url1>' --url '<url2>'`. Each
-     receipt's month is read from its "Date paid" (ClassPass files a charge under the month
-     it was paid in), and the script refuses a receipt that doesn't match `--month` if given.
-  Without Claude in Chrome, give the user those steps and ask them to paste the URLs.
+- **classpass** — automatic on macOS via the logged-in Chrome session: the script reads the
+  charges and their Stripe receipt links from ClassPass and renders each receipt. Each receipt's
+  month is checked against its "Date paid". If the session has expired, the user must log in at
+  https://classpass.com/settings/charges in Chrome (never submit a login form for them), then
+  wait ~30 seconds and retry. "No ClassPass membership charge in <month> yet" means it hasn't
+  been charged. Only if the automatic method fails for another reason, fall back to collecting
+  the links by hand (with Claude in Chrome if available, otherwise ask the user):
+  1. Open https://classpass.com/settings/charges; clicking a charge row opens its Stripe
+     receipt in a new tab — collect the `pay.stripe.com/receipts/...` URLs.
+  2. Pass them all in one run: `fetch classpass --url '<url1>' --url '<url2>'`.
 - **verizon** — download the bill PDF from https://www.verizon.com/my-bill/ in a real Chrome
   session (via Claude in Chrome if available, else ask the user), then
   `fetch verizon --month <M> --pdf <downloaded file>`.
