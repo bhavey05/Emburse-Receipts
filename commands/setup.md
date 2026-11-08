@@ -26,16 +26,25 @@ Set up the receipts plugin. Work through this checklist, fixing issues as you fi
      their Chrome River profile, or be added as an alternative email
      (Preferences/Settings → Personal Settings → Alternative Emails). Ask them
      to confirm this before finishing setup.
-   - **gmail app password unset** → the password must NOT pass through this chat. Tell the user to:
-     1. Create an app password at https://myaccount.google.com/apppasswords (requires 2-Step Verification).
-     2. Run this in their own terminal (it prompts with hidden input and stores the password in the macOS keychain):
-        ```bash
-        python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" config --set-app-password
-        ```
-     Alternatively they can `export GMAIL_APP_PASSWORD=...` in their shell profile. Wait for them to confirm before continuing.
+   - **gmail app password unset** → the password must NOT pass through this chat.
+     - If the doctor says it's exported in a shell file like `~/.zshrc` (common: that works in a
+       terminal but not in the Claude desktop app, which doesn't load it), offer to copy it into the
+       keychain with the exact command the doctor prints (`zsh -ic '... config --set-app-password --from-env'`).
+       The value is read from the shell environment and never shown. Run it only after the user agrees.
+     - Otherwise tell the user to:
+       1. Create an app password at https://myaccount.google.com/apppasswords (requires 2-Step Verification).
+       2. Run this in their own terminal (hidden prompt; stores the password in the macOS keychain):
+          ```bash
+          python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" config --set-app-password
+          ```
+       Wait for them to confirm before continuing.
+   - **gmail login FAIL** → the address/app password pair is wrong or the app password was revoked;
+     have them create a new app password and store it as above.
 
 3. `[warn]` lines are provider-specific (macOS / Chrome profile are only needed for T-Mobile's automatic fetch). Mention them but don't block on them.
 
-4. Re-run the doctor to confirm everything passes, then tell the user they're ready and show an example: `/emburse-receipts:fetch tmobile` (or `classpass` / `verizon`).
+4. Re-run the doctor to confirm everything passes, then run `receipts.py status` so the send
+   history is backfilled from Gmail's Sent folder, and tell the user they're ready: `/emburse-receipts:status`
+   shows what's missing and `/emburse-receipts:send pending` submits it.
 
 Never echo, log, or store the app password yourself, and never print cookie values.
