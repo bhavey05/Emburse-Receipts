@@ -81,7 +81,7 @@ AUTO_INTERVAL = timedelta(days=14)
 DEFAULT_AUTO_PROVIDERS = ["tmobile", "classpass"]
 TMOBILE_REJECTED = "rejected the Chrome session"
 TMOBILE_LOGIN_URL = "https://www.t-mobile.com/bill/summary"
-STRIPE_URL_RE = re.compile(r"https://pay\.stripe\.com/receipts/[^\s'\"`<>)\]]+")
+STRIPE_LINE_RE = re.compile(r"^(\d{4}-\d{2})\s+(https://pay\.stripe\.com/receipts/\S{20,})$")
 
 PROVIDERS = {"classpass": "ClassPass", "tmobile": "T-Mobile", "verizon": "Verizon"}
 SUBJECT_RE = re.compile(r"^(?P<label>.+?) Receipt - (?P<month>[A-Z][a-z]+ \d{4})")
@@ -1065,21 +1065,34 @@ def collect_stripe_urls(months: list[str]) -> list[str]:
     prompt = CLASSPASS_PROMPT.format(months=", ".join(month_label(m) for m in months))
     command = [
         claude, "-p", "--chrome", "--model", "sonnet", "--permission-mode", "bypassPermissions",
-        "--disallowedTools", "Bash,Edit,Write,NotebookEdit", prompt,
+        "--disallowedTools", "Bash,Edit,Write,NotebookEdit",
     ]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=900, cwd=BASE_DIR)
+        result = subprocess.run(command, input=prompt, capture_output=True, text=True, timeout=900, cwd=BASE_DIR)
     except subprocess.TimeoutExpired:
         raise ReceiptError("Claude in Chrome timed out (15 min) reading the ClassPass charges")
     except OSError as error:
         raise ReceiptError(f"couldn't run claude: {error}")
 
-    output = (result.stdout or "") + (result.stderr or "")
-    if "NEEDS_LOGIN" in output:
+    stdout, stderr = result.stdout or "", result.stderr or ""
+    print(f"Claude in Chrome output: {stdout.strip()[:2000]}", flush=True)
+    combined = stdout + stderr
+    if "Failed to authenticate" in combined or "OAuth" in combined:
+        raise ReceiptError(
+            "Claude Code isn't logged in (session expired). Run `claude` in a terminal and use /login, then rerun."
+        )
+    if "NEEDS_LOGIN" in stdout:
         raise ReceiptError("ClassPass needs a login. Log in at https://classpass.com/settings/charges in Chrome, then rerun.")
-    urls = list(dict.fromkeys(STRIPE_URL_RE.findall(output)))
+    if result.returncode != 0:
+        raise ReceiptError(f"claude exited {result.returncode}: ...{combined.strip()[-300:]}")
+    urls = []
+    for line in stdout.splitlines():
+        match = STRIPE_LINE_RE.match(line.strip().strip("`").strip())
+        if match:
+            urls.append(match.group(2))
+    urls = list(dict.fromkeys(urls))
     if not urls:
-        raise ReceiptError(f"Claude in Chrome returned no Stripe receipt URLs. Output ended: ...{output.strip()[-300:]}")
+        raise ReceiptError(f"Claude in Chrome returned no Stripe receipt URLs. Output ended: ...{combined.strip()[-300:]}")
     return urls
 
 
