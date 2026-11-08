@@ -57,7 +57,7 @@ Guard rails:
 | Provider | How it works |
 |---|---|
 | T-Mobile | Fully automatic (macOS): uses your logged-in Chrome session's cookies to call T-Mobile's bill API and download the PDF. Log in at t-mobile.com in Chrome first. |
-| ClassPass | ClassPass blocks bots, so each charge needs its `pay.stripe.com` receipt URL from https://classpass.com/settings/charges (Claude in Chrome can grab them for you; links expire after a few weeks). Pass several `--url`s at once — each is filed under the month it was paid. |
+| ClassPass | Fully automatic (macOS), like T-Mobile: uses your logged-in Chrome session's cookies to find the month's charge through ClassPass's internal API and render its `pay.stripe.com` receipt. Log in at classpass.com in Chrome first. Scheduled runs fall back to Claude in Chrome if the `claude` CLI is installed. `--url <stripe receipt URL>` still works (each is filed under the month it was paid). |
 | Verizon | No stable API — download the bill PDF from https://www.verizon.com/my-bill/ (Claude in Chrome can do it) and the plugin imports it. |
 
 Any provider also accepts an already-downloaded PDF via `--pdf`.
@@ -94,19 +94,19 @@ python3 scripts/receipts.py schedule uninstall
   downloaded PDF). Add `"auto_skip": ["tmobile/2026-09"]` to `config.json` to never send specific months.
 - It covers every month from `auto_since` through last month that isn't in the send log.
 - T-Mobile: if the Chrome session was rejected, it opens T-Mobile in Chrome, waits 45s, and retries once.
-- ClassPass: with no cached receipt, it runs `claude -p --chrome` to click the charges in your logged-in Chrome
-  and read the Stripe receipt URLs (Claude in Chrome required; it never enters credentials). Each receipt's
-  month is verified before sending.
+- ClassPass: it reads the month's charge from ClassPass's API using your Chrome session (same session-expired retry as T-Mobile). Only if that fails for another reason, and the `claude` CLI is installed (optional), it runs `claude -p --chrome` to click the charges in your logged-in Chrome and read the Stripe receipt URLs (it never enters credentials). Each receipt's month is verified before sending.
 - Notifications report what was sent or what needs attention. Logs: `~/.claude-receipts/runs.log`.
-- `install` creates `~/.claude-receipts/venv` with Playwright; the agent needs the `claude` CLI on your machine.
+- `install` creates `~/.claude-receipts/venv` with Playwright; the `claude` CLI is optional (ClassPass fallback only).
 - The agent runs a copy at `~/.claude-receipts/bin/receipts.py` (launchd can't read `~/Documents`); rerun `schedule install` after updating the script.
+- The job waits up to 2 minutes for the network before syncing. When the Claude Code plugin is updated, the scheduled copy picks up the new version on its next run.
 
 ## Security notes, read before installing
 
-- The T-Mobile fetch **reads your Chrome cookies** (macOS only): it copies the
-  cookie DB, decrypts values locally using the Chrome Safe Storage key from
-  your keychain, and sends them only to `t-mobile.com`. Cookie values are
-  never printed or stored.
+- The T-Mobile and ClassPass fetches **read your Chrome cookies** (macOS only): they
+  copy the cookie DB, decrypt values locally using the Chrome Safe Storage key
+  from your keychain, and send them only to `t-mobile.com` / `classpass.com`
+  respectively. Cookie values (and the ClassPass API token) are never printed or
+  stored.
 - Your Gmail app password lives in your macOS keychain (service
   `claude-receipts-gmail`) or the `GMAIL_APP_PASSWORD` env var — never in this
   repo's files. Prefer the keychain: the Claude desktop app doesn't load

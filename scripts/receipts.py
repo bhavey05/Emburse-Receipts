@@ -34,6 +34,7 @@ import plistlib
 import re
 import shutil
 import smtplib
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -62,6 +63,7 @@ LOCK_PATH = BASE_DIR / ".lock"
 VENV_DIR = BASE_DIR / "venv"
 RUN_LOG = BASE_DIR / "runs.log"
 INSTALLED_SCRIPT = BASE_DIR / "bin" / "receipts.py"
+CLAUDE_PLUGINS_JSON = Path("~/.claude/plugins/installed_plugins.json").expanduser()
 KEYCHAIN_SERVICE = "claude-receipts-gmail"
 SHELL_RC_FILES = ("~/.zshrc", "~/.zprofile", "~/.zshenv", "~/.bash_profile", "~/.bashrc", "~/.profile")
 
@@ -74,6 +76,11 @@ GMAIL_IMAP_HOST = "imap.gmail.com"
 TMOBILE_BILL_SUMMARY_URL = "https://www.t-mobile.com/self-service-pub/v1/bill-summary"
 TMOBILE_PDF_URL = "https://www.t-mobile.com/self-service-britebill/billing/v2/billdetails"
 CLASSPASS_CHARGES_URL = "https://classpass.com/settings/charges"
+CLASSPASS_API = "https://classpass.com/_api"
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+)
 
 LAUNCH_LABEL = "com.emburse-receipts.auto"
 LAUNCH_PLIST = Path(f"~/Library/LaunchAgents/{LAUNCH_LABEL}.plist").expanduser()
@@ -81,6 +88,8 @@ AUTO_INTERVAL = timedelta(days=14)
 DEFAULT_AUTO_PROVIDERS = ["tmobile", "classpass"]
 TMOBILE_REJECTED = "rejected the Chrome session"
 TMOBILE_LOGIN_URL = "https://www.t-mobile.com/bill/summary"
+CLASSPASS_REJECTED = "ClassPass session in Chrome has expired"
+CLASSPASS_NO_CHARGE = "no ClassPass membership charge"
 STRIPE_LINE_RE = re.compile(r"^(\d{4}-\d{2})\s+(https://pay\.stripe\.com/receipts/\S{20,})$")
 
 PROVIDERS = {"classpass": "ClassPass", "tmobile": "T-Mobile", "verizon": "Verizon"}
@@ -89,6 +98,10 @@ SUBJECT_RE = re.compile(r"^(?P<label>.+?) Receipt - (?P<month>[A-Z][a-z]+ \d{4})
 
 class ReceiptError(Exception):
     """A receipt couldn't be fetched or sent; the message says what to do about it."""
+
+
+class ClassPassNoCharge(ReceiptError):
+    """ClassPass has no membership charge for that month (yet)."""
 
 
 class LockHeld(ReceiptError):
@@ -462,24 +475,99 @@ def render_stripe_receipt(page, url: str, months: list[str] | None) -> tuple[str
     return month, pdf_path, info
 
 
+def _classpass_expired() -> ReceiptError:
+    return ReceiptError(
+        f"{CLASSPASS_REJECTED}. Log in at {CLASSPASS_CHARGES_URL} in Chrome, wait ~30s"
+        " (Chrome saves cookies to disk periodically), then retry."
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _classpass_session() -> tuple[dict, list[dict]] | ReceiptError:
+    """API headers + billing history (or the login failure), fetched once per run however many months are requested."""
+    try:
+        return _classpass_login()
+    except ReceiptError as error:
+        return error
+
+
+def _classpass_login() -> tuple[dict, list[dict]]:
+    try:
+        cookie_header = _chrome_cookie_header("classpass.com")
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        raise ReceiptError(f"couldn't read the ClassPass session from Chrome: {error}")
+    page_headers = {"User-Agent": CHROME_USER_AGENT, "Accept": "text/html", "Cookie": cookie_header}
+    status, _, body = _get(CLASSPASS_CHARGES_URL, page_headers)
+    html = body.decode("utf-8", "replace")
+    token = re.search(r'"token"\s*:\s*"([0-9a-fA-F]+)"', html)
+    user_id = re.search(r'"userId"\s*:\s*"?(\d+)"?', html)
+    if status != 200 or not re.search(r'"loggedIn"\s*:\s*true', html) or not token or not user_id:
+        raise _classpass_expired()
+
+    headers = {
+        "CP-Authorization": f"Token {token.group(1)}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Cookie": cookie_header,
+        "User-Agent": CHROME_USER_AGENT,
+        "Referer": CLASSPASS_CHARGES_URL,
+    }
+    status, _, body = _get(f"{CLASSPASS_API}/bff/v1/users/{user_id.group(1)}/billing_history", headers)
+    if status == 401:
+        raise _classpass_expired()
+    if status != 200:
+        raise ReceiptError(f"ClassPass billing history request failed ({status})")
+    return headers, json.loads(body).get("billing_history", [])
+
+
+def classpass_receipt_url(month: str) -> str:
+    session = _classpass_session()
+    if isinstance(session, ReceiptError):
+        raise session
+    headers, history = session
+    charges = [
+        entry
+        for entry in history
+        if entry.get("type") == "membership"
+        and not entry.get("credit")
+        and entry.get("has_receipt") is not False
+        and datetime.fromtimestamp(entry["created_on"]).strftime("%Y-%m") == month
+    ]
+    if not charges:
+        raise ClassPassNoCharge(f"{CLASSPASS_NO_CHARGE} in {month_label(month)} yet")
+    if len(charges) > 1:
+        raise ReceiptError(
+            f"{len(charges)} ClassPass membership charges in {month_label(month)}; get the right receipt URL from"
+            f" {CLASSPASS_CHARGES_URL} and submit it with: fetch classpass --month {month} --url '<url>'"
+        )
+    status, _, body = _get(f"{CLASSPASS_API}/v1/transactions/purchase/{charges[0]['transactions_id']}/receipt-url", headers)
+    if status == 401:
+        raise _classpass_expired()
+    if status != 200:
+        raise ReceiptError(f"ClassPass receipt-url request failed ({status})")
+    url = json.loads(body).get("receipt_url") or ""
+    if not url.startswith("https://pay.stripe.com/receipts/"):
+        raise ReceiptError(f"ClassPass returned no Stripe receipt URL for {month_label(month)}")
+    return url
+
+
 def classpass_pdf(month: str) -> tuple[Path, dict]:
     pdf_path = receipt_path("classpass", month)
     if pdf_path.exists():
         print(f"Using existing PDF: {pdf_path}")
         return pdf_path, receipt_info("classpass", month, pdf_path)
-    cached_url = read_json(CLASSPASS_URL_CACHE).get(month)
-    if cached_url:
-        print(f"Using cached Stripe URL for {month_label(month)}")
-        with stripe_page() as page:
-            _, pdf_path, info = render_stripe_receipt(page, cached_url, [month])
-        return pdf_path, info
-
-    raise ReceiptError(
-        f"no Stripe receipt URL yet. ClassPass blocks bots, so get it from a real Chrome session:"
-        f" open {CLASSPASS_CHARGES_URL}, click the charge paid in {month_label(month)}, copy the"
-        " pay.stripe.com/receipts/... URL, then rerun with --url '<url>' (repeat --url for several"
-        " months; each receipt's month is read from its payment date)."
-    )
+    try:
+        url = classpass_receipt_url(month)
+    except ReceiptError as error:
+        url = read_json(CLASSPASS_URL_CACHE).get(month)
+        if not url:
+            raise ReceiptError(
+                f"{str(error).rstrip('.')}. Or pass the receipt URL from {CLASSPASS_CHARGES_URL} with --url."
+            )
+        print(f"ClassPass API unavailable ({error}); using cached Stripe URL for {month_label(month)}")
+    with stripe_page() as page:
+        _, pdf_path, info = render_stripe_receipt(page, url, [month])
+    return pdf_path, info
 
 
 # --- Verizon (no stable public API; import a PDF downloaded from My Verizon) ---
@@ -577,6 +665,15 @@ def _post(url: str, body: str | dict, headers: dict[str, str]) -> tuple[int, str
         return error.code, error.headers.get("content-type", ""), error.read()
 
 
+def _get(url: str, headers: dict[str, str]) -> tuple[int, str, bytes]:
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            return response.status, response.headers.get("content-type", ""), response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.headers.get("content-type", ""), error.read()
+
+
 def _bill_month(bill: dict) -> str:
     return datetime.fromisoformat(bill["endTime"]).strftime("%Y-%m")
 
@@ -596,10 +693,7 @@ def _tmobile_login() -> tuple[dict, list[dict]]:
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         raise ReceiptError(f"couldn't read the T-Mobile session from Chrome: {error}")
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": CHROME_USER_AGENT,
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Origin": "https://www.t-mobile.com",
@@ -1039,7 +1133,7 @@ def _fetch(args: argparse.Namespace) -> None:
 CLASSPASS_PROMPT = (
     "Use only the Claude in Chrome browser tools. Open https://classpass.com/settings/charges in a new tab."
     " If ClassPass shows a login page, do not enter any credentials; reply with exactly NEEDS_LOGIN and stop."
-    " Find the subscription charges paid in these months: {months} (ClassPass charges around the 27th)."
+    " Find the subscription charges paid in these months: {months}."
     " For each one, click the charge row; it opens a Stripe receipt in a new tab."
     " If clicking the row by reference doesn't open it, click the row's chevron by coordinates."
     " Read the new tab's URL from the tab list; it starts with https://pay.stripe.com/receipts/."
@@ -1116,50 +1210,69 @@ def pending_receipts(log: dict) -> list[tuple[str, str]]:
     ]
 
 
-def _fetch_tmobile(months: list[str], send: bool, ready: list, errors: dict) -> None:
+def _fetch_with_retry(
+    provider: str, months: list[str], send: bool, ready: list, fetcher, rejected_marker: str, login_url: str, session
+) -> dict:
+    """Fetch each month; if the browser session was rejected, open the login page, wait, and retry once.
+
+    Returns {month: problem} for what still failed.
+    """
     def get(month: str):
-        return _try(lambda: (month, *tmobile_pdf(month)))
+        return _try(lambda: (month, *fetcher(month)))
 
     outcomes = {month: get(month) for month in months}
-    if send and any(TMOBILE_REJECTED in (problem or "") for _, problem in outcomes.values()):
-        subprocess.run(["open", "-g", "-a", "Google Chrome", TMOBILE_LOGIN_URL], check=False)
+    if send and any(rejected_marker in (problem or "") for _, problem in outcomes.values()):
+        subprocess.run(["open", "-g", "-a", "Google Chrome", login_url], check=False)
         time.sleep(45)
-        _tmobile_session.cache_clear()
+        session.cache_clear()
         outcomes = {
-            month: get(month) if TMOBILE_REJECTED in (problem or "") else (result, problem)
+            month: get(month) if rejected_marker in (problem or "") else (result, problem)
             for month, (result, problem) in outcomes.items()
         }
+    failures = {}
     for month, (result, problem) in outcomes.items():
         if problem:
-            _fail(errors, "tmobile", month, problem)
+            failures[month] = problem
         else:
-            ready.append(("tmobile", *result))
+            ready.append((provider, *result))
+    return failures
+
+
+def _fetch_tmobile(months: list[str], send: bool, ready: list, errors: dict) -> None:
+    failures = _fetch_with_retry(
+        "tmobile", months, send, ready, tmobile_pdf, TMOBILE_REJECTED, TMOBILE_LOGIN_URL, _tmobile_session
+    )
+    for month, problem in failures.items():
+        _fail(errors, "tmobile", month, problem)
 
 
 def _fetch_classpass(months: list[str], send: bool, ready: list, errors: dict) -> list[str]:
-    """Fetches what needs no browser; returns the months that still need the Claude-in-Chrome step."""
-    cache = read_json(CLASSPASS_URL_CACHE)
-    need_browser = []
-    for month in months:
-        if receipt_path("classpass", month).exists() or cache.get(month):
-            _attempt(ready, errors, "classpass", month, lambda: (month, *classpass_pdf(month)))
-        else:
-            need_browser.append(month)
-    if not (send and need_browser):
-        return need_browser
+    """Fetches via the Chrome session's API; returns the months that need (or would need) the Claude-in-Chrome fallback."""
+    failures = _fetch_with_retry(
+        "classpass", months, send, ready, classpass_pdf, CLASSPASS_REJECTED, CLASSPASS_CHARGES_URL, _classpass_session
+    )
+    fallback = [month for month, problem in failures.items() if CLASSPASS_NO_CHARGE not in problem]
+    for month, problem in failures.items():
+        if month not in fallback or not (send and claude_binary()):
+            _fail(errors, "classpass", month, problem)
+    if not (send and fallback and claude_binary()):
+        return fallback if claude_binary() else []
 
-    label = ", ".join(need_browser)
     try:
-        urls = collect_stripe_urls(need_browser)
+        urls = collect_stripe_urls(fallback)
     except ReceiptError as error:
-        _fail(errors, "classpass", label, error)
-        return need_browser
+        for month in fallback:
+            _fail(errors, "classpass", month, f"{failures[month]} Claude in Chrome fallback also failed: {error}")
+        return fallback
+    before = len(ready)
     with stripe_page() as page:
         for number, url in enumerate(urls, 1):
-            _attempt(
-                ready, errors, "classpass", f"URL #{number}", lambda: render_stripe_receipt(page, url, need_browser)
-            )
-    return need_browser
+            _attempt(ready, errors, "classpass", f"URL #{number}", lambda: render_stripe_receipt(page, url, fallback))
+    got = {item[1] for item in ready[before:]}
+    for month in fallback:
+        if month not in got:
+            _fail(errors, "classpass", month, f"{failures[month]} (the Claude in Chrome fallback didn't produce it)")
+    return fallback
 
 
 def _describe_sent(sent: list) -> str:
@@ -1169,16 +1282,58 @@ def _describe_sent(sent: list) -> str:
     return "; ".join(f"{label} {', '.join(months)}" for label, months in by_provider.items())
 
 
+def wait_for_network(host: str = GMAIL_IMAP_HOST, port: int = 993, timeout: int = 120) -> bool:
+    """A launchd run on wake can fire before Wi-Fi is back."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            socket.create_connection((host, port), timeout=5).close()
+            return True
+        except OSError:
+            if time.monotonic() + 10 > deadline:
+                print(f"Network still unreachable ({host}:{port}) after {timeout}s; continuing anyway.", flush=True)
+                return False
+            time.sleep(10)
+
+
+def plugin_script() -> Path | None:
+    """receipts.py inside the installed Claude Code plugin, if there is one."""
+    try:
+        plugins = json.loads(CLAUDE_PLUGINS_JSON.read_text()).get("plugins", {})
+        entries = next(v for k, v in plugins.items() if k.startswith("emburse-receipts@") and v)
+        script = Path(entries[0]["installPath"]).expanduser() / "scripts" / "receipts.py"
+    except (OSError, ValueError, StopIteration, KeyError, IndexError, TypeError, AttributeError):
+        return None
+    return script if script.exists() else None
+
+
+def refresh_from_plugin(state: dict) -> None:
+    """Pick up a plugin update: copy the plugin's script over the scheduled copy and restart on it."""
+    if Path(__file__).resolve() != INSTALLED_SCRIPT.resolve():
+        return
+    script = plugin_script()
+    if not script or sha256_file(script) == state.get("plugin_script_sha256"):
+        return
+    install_script(script)
+    state["plugin_script_sha256"] = sha256_file(script)
+    write_json(AUTO_STATE_PATH, state)
+    print(f"Updated the scheduled script from the plugin at {script}", flush=True)
+    os.execv(sys.executable, [sys.executable, str(INSTALLED_SCRIPT), *sys.argv[1:]])
+
+
 def auto(args: argparse.Namespace) -> None:
+    state = read_json(AUTO_STATE_PATH)
     if args.send:
         print(f"=== auto --send {datetime.now():%Y-%m-%d %H:%M} ===", flush=True)
-    state = read_json(AUTO_STATE_PATH)
+        refresh_from_plugin(state)
     if args.send and not args.now and state.get("last_success"):
         last = datetime.fromisoformat(state["last_success"])
         due = last + AUTO_INTERVAL
         if datetime.now() < due:
             print(f"Last successful run: {last:%Y-%m-%d %H:%M}. Next due: {due:%Y-%m-%d} (use --now to run anyway).")
             return
+    if args.send:
+        wait_for_network()
     if not get_auto_since():
         sys.exit("auto_since isn't set. Run: receipts.py config --auto-since YYYY-MM (earliest month to submit)")
 
@@ -1241,7 +1396,7 @@ def _auto_run(args: argparse.Namespace, state: dict) -> bool:
             print_send_plan(ready)
         if need_browser:
             print(
-                "\nClassPass months needing the browser step (Claude in Chrome, only with --send): "
+                "\nClassPass months that would need the Claude in Chrome fallback (only with --send): "
                 + ", ".join(need_browser)
             )
         if errors:
@@ -1286,12 +1441,13 @@ def install_script(source: Path, destination: Path = INSTALLED_SCRIPT) -> Path:
     return destination
 
 
-def build_plist(venv_python: Path, script: Path, claude: str, log_path: Path, receipts_home: str | None) -> bytes:
+def build_plist(venv_python: Path, script: Path, claude: str | None, log_path: Path, receipts_home: str | None) -> bytes:
     environment = {
-        "PATH": f"{Path(claude).parent}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        "RECEIPTS_CLAUDE_BIN": claude,
+        "PATH": ":".join(([str(Path(claude).parent)] if claude else []) + ["/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]),
         "PYTHONUNBUFFERED": "1",
     }
+    if claude:
+        environment["RECEIPTS_CLAUDE_BIN"] = claude
     if receipts_home:
         environment["RECEIPTS_HOME"] = receipts_home
     return plistlib.dumps(
@@ -1319,13 +1475,18 @@ def schedule(args: argparse.Namespace) -> None:
     if args.action == "install":
         claude = claude_binary()
         if not claude:
-            sys.exit("the claude CLI wasn't found (needed for ClassPass). Install Claude Code or set RECEIPTS_CLAUDE_BIN.")
+            print("claude CLI not found: ClassPass will use only your Chrome session (no Claude in Chrome fallback)")
         try:
             python = ensure_venv()
         except subprocess.CalledProcessError as error:
             sys.exit(f"couldn't set up {VENV_DIR}: {error}")
         LAUNCH_PLIST.parent.mkdir(parents=True, exist_ok=True)
         script = install_script(Path(__file__).resolve())
+        plugin = plugin_script()
+        if plugin:
+            state = read_json(AUTO_STATE_PATH)
+            state["plugin_script_sha256"] = sha256_file(plugin)
+            write_json(AUTO_STATE_PATH, state)
         LAUNCH_PLIST.write_bytes(build_plist(python, script, claude, RUN_LOG, os.environ.get("RECEIPTS_HOME")))
         _launchctl("bootout", target)
         result = _launchctl("bootstrap", f"gui/{os.getuid()}", str(LAUNCH_PLIST))
@@ -1346,6 +1507,12 @@ def schedule(args: argparse.Namespace) -> None:
         print(f"Agent: {'loaded' if loaded else 'not loaded'} ({LAUNCH_LABEL})")
         print(f"Plist: {LAUNCH_PLIST} ({'exists' if LAUNCH_PLIST.exists() else 'missing'})")
         print(f"Script: {INSTALLED_SCRIPT} ({'exists' if INSTALLED_SCRIPT.exists() else 'missing'})")
+        plugin = plugin_script()
+        if not plugin:
+            print("Plugin script: not found")
+        else:
+            same = INSTALLED_SCRIPT.exists() and sha256_file(plugin) == sha256_file(INSTALLED_SCRIPT)
+            print(f"Plugin script: {plugin} ({'matches' if same else 'differs from'} the scheduled copy)")
         print(f"Last run: {state.get('last_run', 'never')}")
         print(f"Last success: {state.get('last_success', 'never')}")
         if state.get("last_success"):
