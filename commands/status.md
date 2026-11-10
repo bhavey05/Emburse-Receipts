@@ -14,6 +14,10 @@ This first backfills the send log from Gmail's Sent folder (so sends made before
 the log existed, or from another machine, count), then prints a month × provider
 table and a "Not sent yet" list.
 
+Months listed under "Left alone" are older than the automatic-sending start month (or in the
+skip list); they are deliberately not treated as missing, so only mention them, don't offer to
+send them unless the user asks.
+
 Summarize it for the user: which months are missing per provider, and offer to
 submit them with `/emburse-receipts:send <providers> <months>` (e.g.
 `/emburse-receipts:send tmobile,classpass 2026-07..2026-09`). Note that the current

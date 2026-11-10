@@ -10,11 +10,15 @@ Everything runs through one script:
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" status                     # sent vs. missing, per month
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" fetch <providers> [--month <months>] [--send]
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" doctor                     # dependency + config check
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" doctor                     # environment + config check
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" config                     # show/update config (--auto-since, --auto-providers)
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" auto [--send] [--now]       # unattended send of all pending months (plan only without --send)
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" schedule install|uninstall|status  # macOS launchd agent: auto --send at login + daily 10:00, gated to 14 days
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" auto [--send] [--now]       # unattended send of everything due (plan only without --send)
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" schedule install|uninstall|status  # macOS launchd agent: auto --send at login + daily 10:00
 ```
+
+The script needs nothing installed beyond Python 3.9+ and Google Chrome (standard library only).
+`auto` treats as due every unsent month since `auto_since`, plus the current month once the
+provider's usual issue day has come; a current-month bill that isn't out yet is not an error.
 
 - `<providers>` is one or more of `tmobile,classpass,verizon`; `--month` takes `YYYY-MM`, a comma list, or a
   range `2026-07..2026-09` (default: previous month). One failing item doesn't stop the batch; all problems
@@ -24,7 +28,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/receipts.py" schedule install|uninstall|s
 - Without `--send`, fetch only saves PDFs (under `~/.claude-receipts/receipts/`) and prints the send plan with
   each receipt's amount and date. Always show the plan and get the user's confirmation (once per batch)
   before rerunning with `--send` — it emails financial documents externally.
-- If anything fails from missing dependencies or config, run `doctor` and fix what it reports (or point the
+- If anything fails from missing config, run `doctor` and fix what it reports (or point the
   user at `/emburse-receipts:setup`).
 - Every send is recorded in `~/.claude-receipts/sent.json`; repeat sends for the same provider/month are
   skipped. Never add `--force` on your own — only when the user explicitly confirms a resend. `BLOCKED` means
@@ -38,9 +42,11 @@ On a session error (401), the user needs to log in at https://www.t-mobile.com/b
 ~30s after login (Chrome flushes cookies to disk periodically) before retrying.
 
 **ClassPass** — automatic on macOS, like T-Mobile: the script uses the logged-in Chrome session's cookies to
-read the charges and their Stripe receipt links from ClassPass's API, then renders each receipt. A month = the
-month the charge was paid; each receipt's "Date paid" is checked. On an expired session, the user needs to log
-in at https://classpass.com/settings/charges in Chrome (never submit a login for them) and wait ~30s. Only if
+read the charges and their Stripe receipt links from ClassPass's API, then prints each receipt to PDF with
+headless Chrome. A month = the month the charge was paid; each receipt's "Date paid" is checked. On an expired
+session, the user needs to log in at https://classpass.com/settings/charges in Chrome (never submit a login for
+them) and wait ~30s. "ClassPass's bot protection blocked this Python's network library" is not a login problem:
+macOS's built-in Python (LibreSSL) is rejected; they need a Python built on OpenSSL 3 (`brew install python`). Only if
 the automatic method fails for another reason: collect the `pay.stripe.com/receipts/...` links by clicking
 each charge on that page (Claude in Chrome if available, otherwise ask the user) and pass them with
 `fetch classpass --url '<u1>' --url '<u2>'`.
@@ -55,15 +61,15 @@ Any provider also accepts `--pdf <path>` to import an already-downloaded PDF.
 
 Add a `<name>_pdf(month) -> (Path, info)` function in `scripts/receipts.py` (raise `ReceiptError` with a
 what-to-do message when it can't fetch; record metadata with `record_receipt`), then register it in
-`PROVIDERS` and `FETCHERS`. Prefer, in order: a public receipt URL rendered via Playwright (like ClassPass),
+`PROVIDERS` and `FETCHERS`. Prefer, in order: a public receipt URL rendered with headless Chrome (like ClassPass),
 an API call using the Chrome session cookies (like T-Mobile), or a browser-download + `--pdf` import (like
 Verizon).
 
 ## Security rules
 
 - Never print, log, or store cookie values, tokens, or the Gmail app password.
-- The app password must not pass through chat: the user sets it via `config --set-app-password` (hidden
-  prompt, macOS keychain), or — with their OK — copy it from their shell profile with
+- The app password must not pass through chat: the user sets it via `config --set-app-password --dialog`
+  (hidden-input macOS dialog, stored in the keychain), or — with their OK — copy it from their shell profile with
   `zsh -ic '... config --set-app-password --from-env'` (the value is never displayed).
 - Always get explicit confirmation before `--send`. `auto --send` and `schedule install` also email receipts
   immediately — run them only with the user's explicit OK (`/emburse-receipts:setup` covers this).

@@ -25,7 +25,10 @@ failures and lists every problem at the end:
   month is checked against its "Date paid". If the session has expired, the user must log in at
   https://classpass.com/settings/charges in Chrome (never submit a login form for them), then
   wait ~30 seconds and retry. "No ClassPass membership charge in <month> yet" means it hasn't
-  been charged. Only if the automatic method fails for another reason, fall back to collecting
+  been charged. "ClassPass's bot protection blocked this Python's network library" is not a
+  login problem: macOS's built-in Python is rejected, so they need a newer one (e.g.
+  `brew install python`); `/emburse-receipts:setup` covers it. Only if the automatic method
+  fails for another reason, fall back to collecting
   the links by hand (with Claude in Chrome if available, otherwise ask the user):
   1. Open https://classpass.com/settings/charges; clicking a charge row opens its Stripe
      receipt in a new tab — collect the `pay.stripe.com/receipts/...` URLs.
@@ -34,7 +37,7 @@ failures and lists every problem at the end:
   session (via Claude in Chrome if available, else ask the user), then
   `fetch verizon --month <M> --pdf <downloaded file>`.
 
-If the script fails because of missing dependencies or config, suggest `/emburse-receipts:setup`.
+If the script fails because of missing config (or Google Chrome isn't installed), suggest `/emburse-receipts:setup`.
 
 When done, show the saved PDFs and the printed send plan (with amounts/dates), and mention
 `/emburse-receipts:send` to email them. Never print cookie values or credentials.
