@@ -10,23 +10,26 @@
   python3 receipts.py sync                                          # backfill send history from Gmail Sent
   python3 receipts.py doctor                                        # check dependencies + config
   python3 receipts.py config --send-to receipt@ca1.chromeriver.com
+  python3 receipts.py config --set-app-password --dialog            # Gmail app password via a hidden macOS dialog
   python3 receipts.py config --auto-since 2026-08                   # earliest month `auto` may submit
-  python3 receipts.py auto [--send] [--now]                         # unattended: send every pending month
+  python3 receipts.py auto [--send] [--now]                         # unattended: send every receipt that's due
   python3 receipts.py schedule install|uninstall|status             # macOS launchd agent running `auto --send`
 
 Without --send, fetch only saves PDFs and prints the send plan.
+Standard library only; receipts are rendered with the installed Google Chrome.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import email
 import fcntl
 import functools
 import getpass
 import hashlib
+import html
 import imaplib
-import importlib.util
 import json
 import os
 import platform
@@ -36,6 +39,7 @@ import shutil
 import smtplib
 import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -60,19 +64,21 @@ CLASSPASS_URL_CACHE = BASE_DIR / "stripe-urls.json"
 SENT_LOG = BASE_DIR / "sent.json"
 AUTO_STATE_PATH = BASE_DIR / "auto-state.json"
 LOCK_PATH = BASE_DIR / ".lock"
-VENV_DIR = BASE_DIR / "venv"
 RUN_LOG = BASE_DIR / "runs.log"
 INSTALLED_SCRIPT = BASE_DIR / "bin" / "receipts.py"
 CLAUDE_PLUGINS_JSON = Path("~/.claude/plugins/installed_plugins.json").expanduser()
 KEYCHAIN_SERVICE = "claude-receipts-gmail"
 SHELL_RC_FILES = ("~/.zshrc", "~/.zprofile", "~/.zshenv", "~/.bash_profile", "~/.bashrc", "~/.profile")
 
-CHROME_PROFILE = Path(
-    os.environ.get("RECEIPTS_CHROME_PROFILE", "~/Library/Application Support/Google/Chrome/Default")
+CHROME_DIR = Path("~/Library/Application Support/Google/Chrome").expanduser()
+CHROME_PROFILE = os.environ.get("RECEIPTS_CHROME_PROFILE")
+CHROME_BINARY = Path(
+    os.environ.get("RECEIPTS_CHROME_BIN", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 ).expanduser()
 
 GMAIL_SMTP_HOST = "smtp.gmail.com"
 GMAIL_IMAP_HOST = "imap.gmail.com"
+APP_PASSWORD_URL = "https://myaccount.google.com/apppasswords"
 TMOBILE_BILL_SUMMARY_URL = "https://www.t-mobile.com/self-service-pub/v1/bill-summary"
 TMOBILE_PDF_URL = "https://www.t-mobile.com/self-service-britebill/billing/v2/billdetails"
 CLASSPASS_CHARGES_URL = "https://classpass.com/settings/charges"
@@ -84,12 +90,22 @@ CHROME_USER_AGENT = (
 
 LAUNCH_LABEL = "com.emburse-receipts.auto"
 LAUNCH_PLIST = Path(f"~/Library/LaunchAgents/{LAUNCH_LABEL}.plist").expanduser()
-AUTO_INTERVAL = timedelta(days=14)
+ALERT_EMAIL_INTERVAL = timedelta(days=7)
 DEFAULT_AUTO_PROVIDERS = ["tmobile", "classpass"]
+# Providers that can tell "not issued yet" apart from a failure, so `auto` may try the current month.
+CURRENT_MONTH_PROVIDERS = ("tmobile", "classpass")
 TMOBILE_REJECTED = "rejected the Chrome session"
+TMOBILE_NO_BILL = "no bill for"
 TMOBILE_LOGIN_URL = "https://www.t-mobile.com/bill/summary"
 CLASSPASS_REJECTED = "ClassPass session in Chrome has expired"
 CLASSPASS_NO_CHARGE = "no ClassPass membership charge"
+CLASSPASS_MULTIPLE = "ClassPass membership charges in"
+# ClassPass's bot protection (Cloudflare) turns away some TLS libraries outright; seen with macOS's
+# system Python (LibreSSL), while Pythons built on OpenSSL 3 get through.
+CLASSPASS_BLOCKED = "ClassPass's bot protection blocked"
+TLS_SUSPECT = "LibreSSL" in ssl.OPENSSL_VERSION
+# Failures the Claude in Chrome fallback can't fix either.
+CLASSPASS_NO_FALLBACK = (CLASSPASS_NO_CHARGE, CLASSPASS_REJECTED, CLASSPASS_MULTIPLE)
 STRIPE_LINE_RE = re.compile(r"^(\d{4}-\d{2})\s+(https://pay\.stripe\.com/receipts/\S{20,})$")
 
 PROVIDERS = {"classpass": "ClassPass", "tmobile": "T-Mobile", "verizon": "Verizon"}
@@ -115,6 +131,10 @@ def month_label(month: str) -> str:
 def previous_month() -> str:
     last = datetime.today().replace(day=1) - timedelta(days=1)
     return last.strftime("%Y-%m")
+
+
+def this_month() -> str:
+    return datetime.today().strftime("%Y-%m")
 
 
 def next_month(month: str) -> str:
@@ -214,6 +234,10 @@ def get_auto_since() -> str | None:
 
 def get_auto_providers() -> list[str]:
     return load_config().get("auto_providers") or DEFAULT_AUTO_PROVIDERS
+
+
+def get_auto_skip() -> set[str]:
+    return set(load_config().get("auto_skip") or [])
 
 
 def get_gmail_address() -> str | None:
@@ -381,7 +405,7 @@ def import_pdf(provider: str, month: str, source: str) -> tuple[Path, dict]:
     return pdf_path, record_receipt(provider, month, pdf_path, detail=f"imported from {source_path.name}")
 
 
-# --- ClassPass (Stripe receipt URLs are public; headless Playwright renders them) ---
+# --- ClassPass (Stripe receipt URLs are public; the installed Chrome renders them headless) ---
 
 STRIPE_RECEIPT_NO_RE = re.compile(r"Receipt\s*#\s*([\d-]+)", re.I)
 STRIPE_DATE_PAID_RE = re.compile(r"Date paid\s*([A-Za-z]{3,9}\.? \d{1,2}, \d{4})", re.I)
@@ -398,19 +422,32 @@ def _parse_receipt_date(text: str) -> datetime | None:
     return None
 
 
-@contextmanager
-def stripe_page():
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+def headless_chrome(*args: str) -> bytes:
+    """Run the installed Chrome headless in a throwaway profile, separate from the user's running Chrome."""
+    if not CHROME_BINARY.exists():
+        raise ReceiptError(
+            f"Google Chrome not found at {CHROME_BINARY} (set RECEIPTS_CHROME_BIN if it's installed elsewhere)"
+        )
+    with tempfile.TemporaryDirectory() as profile:
+        command = [
+            str(CHROME_BINARY), "--headless=new", "--disable-gpu", "--no-first-run",
+            f"--user-data-dir={profile}", "--virtual-time-budget=15000", *args,
+        ]
         try:
-            yield browser.new_page(viewport={"width": 1280, "height": 900})
-        finally:
-            browser.close()
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=90)
+        except subprocess.TimeoutExpired:
+            raise ReceiptError("Chrome timed out (90s) loading the Stripe receipt")
+    if result.returncode != 0:
+        raise ReceiptError(f"headless Chrome exited {result.returncode} loading the Stripe receipt")
+    return result.stdout
 
 
-def render_stripe_receipt(page, url: str, months: list[str] | None) -> tuple[str, Path, dict]:
+def _html_text(dom: str) -> str:
+    dom = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", dom)
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", dom)))
+
+
+def render_stripe_receipt(url: str, months: list[str] | None) -> tuple[str, Path, dict]:
     """Render a ClassPass Stripe receipt; its month comes from the receipt's own "Date paid".
 
     If `months` is given, the receipt must have been paid in one of them — this is what stops
@@ -419,9 +456,7 @@ def render_stripe_receipt(page, url: str, months: list[str] | None) -> tuple[str
     if not url.startswith("https://pay.stripe.com/receipts/"):
         raise ReceiptError(f"not a Stripe receipt URL (expected https://pay.stripe.com/receipts/...): {url[:60]}")
     print("Loading Stripe receipt...")
-    page.goto(url, wait_until="networkidle", timeout=30_000)
-    time.sleep(3)
-    text = page.inner_text("body")
+    text = _html_text(headless_chrome("--dump-dom", url).decode("utf-8", "replace"))
 
     receipt_no = STRIPE_RECEIPT_NO_RE.search(text)
     if not receipt_no and "expired" in text.lower():
@@ -432,6 +467,8 @@ def render_stripe_receipt(page, url: str, months: list[str] | None) -> tuple[str
     date_match = STRIPE_DATE_PAID_RE.search(text)
     paid = _parse_receipt_date(date_match.group(1)) if date_match else None
     amount = STRIPE_AMOUNT_PAID_RE.search(text)
+    if not (receipt_no or date_match or amount):
+        raise ReceiptError("the page didn't load as a Stripe receipt (no receipt number, date or amount on it)")
 
     if paid:
         month = paid.strftime("%Y-%m")
@@ -449,14 +486,14 @@ def render_stripe_receipt(page, url: str, months: list[str] | None) -> tuple[str
 
     pdf_path = receipt_path("classpass", month)
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
-    page.pdf(
-        path=str(pdf_path),
-        format="Letter",
-        print_background=True,
-        margin={"top": "0.5in", "bottom": "0.5in", "left": "0.5in", "right": "0.5in"},
-    )
-    if not pdf_path.exists() or pdf_path.stat().st_size == 0:
-        raise ReceiptError(f"rendered PDF is empty or missing: {pdf_path}")
+    rendered = pdf_path.with_name(pdf_path.name + ".tmp")
+    try:
+        headless_chrome("--no-pdf-header-footer", f"--print-to-pdf={rendered}", url)
+        if not rendered.exists() or rendered.read_bytes()[:4] != b"%PDF":
+            raise ReceiptError(f"rendered PDF is empty or missing: {pdf_path}")
+        os.replace(rendered, pdf_path)
+    finally:
+        rendered.unlink(missing_ok=True)
 
     cache = read_json(CLASSPASS_URL_CACHE)
     cache[month] = url
@@ -498,10 +535,15 @@ def _classpass_login() -> tuple[dict, list[dict]]:
         raise ReceiptError(f"couldn't read the ClassPass session from Chrome: {error}")
     page_headers = {"User-Agent": CHROME_USER_AGENT, "Accept": "text/html", "Cookie": cookie_header}
     status, _, body = _get(CLASSPASS_CHARGES_URL, page_headers)
-    html = body.decode("utf-8", "replace")
-    token = re.search(r'"token"\s*:\s*"([0-9a-fA-F]+)"', html)
-    user_id = re.search(r'"userId"\s*:\s*"?(\d+)"?', html)
-    if status != 200 or not re.search(r'"loggedIn"\s*:\s*true', html) or not token or not user_id:
+    if status == 403:
+        raise ReceiptError(
+            f"{CLASSPASS_BLOCKED} this Python's network library ({ssl.OPENSSL_VERSION}); it isn't a login problem."
+            " Run this with a Python built on OpenSSL 3 (e.g. `brew install python`, then use that python3)"
+        )
+    page = body.decode("utf-8", "replace")
+    token = re.search(r'"token"\s*:\s*"([0-9a-fA-F]+)"', page)
+    user_id = re.search(r'"userId"\s*:\s*"?(\d+)"?', page)
+    if status != 200 or not re.search(r'"loggedIn"\s*:\s*true', page) or not token or not user_id:
         raise _classpass_expired()
 
     headers = {
@@ -537,7 +579,7 @@ def classpass_receipt_url(month: str) -> str:
         raise ClassPassNoCharge(f"{CLASSPASS_NO_CHARGE} in {month_label(month)} yet")
     if len(charges) > 1:
         raise ReceiptError(
-            f"{len(charges)} ClassPass membership charges in {month_label(month)}; get the right receipt URL from"
+            f"{len(charges)} {CLASSPASS_MULTIPLE} {month_label(month)}; get the right receipt URL from"
             f" {CLASSPASS_CHARGES_URL} and submit it with: fetch classpass --month {month} --url '<url>'"
         )
     status, _, body = _get(f"{CLASSPASS_API}/v1/transactions/purchase/{charges[0]['transactions_id']}/receipt-url", headers)
@@ -565,8 +607,7 @@ def classpass_pdf(month: str) -> tuple[Path, dict]:
                 f"{str(error).rstrip('.')}. Or pass the receipt URL from {CLASSPASS_CHARGES_URL} with --url."
             )
         print(f"ClassPass API unavailable ({error}); using cached Stripe URL for {month_label(month)}")
-    with stripe_page() as page:
-        _, pdf_path, info = render_stripe_receipt(page, url, [month])
+    _, pdf_path, info = render_stripe_receipt(url, [month])
     return pdf_path, info
 
 
@@ -587,26 +628,35 @@ def verizon_pdf(month: str) -> tuple[Path, dict]:
 
 # --- T-Mobile (reads the logged-in Chrome session's cookies; never prints them) ---
 
-def _chrome_cookie_db() -> Path | None:
-    for candidate in (CHROME_PROFILE / "Cookies", CHROME_PROFILE / "Network" / "Cookies"):
-        if candidate.exists():
-            return candidate
-    return None
+def _chrome_cookie_dbs() -> list[Path]:
+    """Cookie DBs of every Chrome profile (only RECEIPTS_CHROME_PROFILE's, if that's set)."""
+    if CHROME_PROFILE:
+        profiles = [Path(CHROME_PROFILE).expanduser()]
+    else:
+        profiles = [p for p in sorted(CHROME_DIR.glob("*")) if p.name == "Default" or p.name.startswith("Profile ")]
+    candidates = [db for profile in profiles for db in (profile / "Cookies", profile / "Network" / "Cookies")]
+    return [db for db in candidates if db.exists()]
 
 
-def _chrome_cookies(host_filter: str) -> list[tuple[str, str, bytes, str]]:
-    cookie_db = _chrome_cookie_db()
-    if cookie_db is None:
-        raise FileNotFoundError(f"No Chrome Cookies DB under {CHROME_PROFILE}")
+def _chrome_cookies(host: str) -> list[tuple[str, str, bytes, str]]:
+    """Cookies for `host` and its subdomains, from the Chrome profile that used that site most recently."""
+    cookie_dbs = _chrome_cookie_dbs()
+    if not cookie_dbs:
+        raise FileNotFoundError(f"No Chrome Cookies DB under {CHROME_PROFILE or CHROME_DIR}")
+    latest, best = -1, []
     with tempfile.TemporaryDirectory() as tmpdir:
-        copied = Path(tmpdir) / "Cookies"
-        copied.write_bytes(cookie_db.read_bytes())
-        with sqlite3.connect(copied) as conn:
-            return conn.execute(
-                "SELECT host_key, name, encrypted_value, value FROM cookies"
-                " WHERE host_key LIKE ?",
-                (f"%{host_filter}%",),
-            ).fetchall()
+        for number, cookie_db in enumerate(cookie_dbs):
+            copied = Path(tmpdir) / f"Cookies-{number}"
+            copied.write_bytes(cookie_db.read_bytes())
+            with sqlite3.connect(copied) as conn:
+                rows = conn.execute(
+                    "SELECT host_key, name, encrypted_value, value, last_access_utc FROM cookies"
+                    " WHERE host_key = ? OR host_key LIKE ?",
+                    (host, f"%.{host}"),
+                ).fetchall()
+            if rows and max(row[4] for row in rows) > latest:
+                latest, best = max(row[4] for row in rows), [row[:4] for row in rows]
+    return best
 
 
 def _chrome_cookie_header(host_filter: str) -> str:
@@ -614,10 +664,16 @@ def _chrome_cookie_header(host_filter: str) -> str:
         raise RuntimeError("Chrome cookie extraction is only supported on macOS.")
     rows = _chrome_cookies(host_filter)
 
-    password = subprocess.check_output(
-        ["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"],
-        stderr=subprocess.DEVNULL,
-    ).rstrip(b"\n")
+    try:
+        password = subprocess.check_output(
+            ["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"],
+            stderr=subprocess.DEVNULL,
+        ).rstrip(b"\n")
+    except subprocess.CalledProcessError:
+        raise RuntimeError(
+            "macOS didn't release Chrome's cookie key. When the keychain asks whether 'security' may use"
+            " 'Chrome Safe Storage', enter your Mac password and click Always Allow, then retry."
+        )
     key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1003, 16)
 
     pairs = []
@@ -749,7 +805,7 @@ def tmobile_pdf(month: str) -> tuple[Path, dict]:
     if not match:
         available = ", ".join(sorted(_bill_month(bill) for bill in bills))
         raise ReceiptError(
-            f"no bill for {month_label(month)} yet (bills close on the cycle end date). Available: {available}"
+            f"{TMOBILE_NO_BILL} {month_label(month)} yet (bills close on the cycle end date). Available: {available}"
         )
 
     print(f"Downloading T-Mobile bill for {month_label(month)}")
@@ -814,6 +870,23 @@ def send_email(pdf_path: Path, provider_label: str, month: str, info: dict) -> N
     print(f"  Sent: {msg['Subject']}")
 
 
+def send_alert_email(problems: str) -> None:
+    """Email yourself what a scheduled run couldn't do; a notification alone is easy to miss."""
+    gmail_address, gmail_app_password = gmail_credentials()
+    msg = MIMEText(
+        f"The scheduled receipt run couldn't finish:\n\n{problems}\n\n"
+        "Fix what it describes (usually: log in to the provider in Chrome). The next daily run retries,"
+        " or run /emburse-receipts:send pending in Claude Code.\n"
+        f"Log: {RUN_LOG}\n",
+        "plain",
+    )
+    msg["From"] = msg["To"] = gmail_address
+    msg["Subject"] = "Emburse receipts need attention"
+    with smtplib.SMTP_SSL(GMAIL_SMTP_HOST, 465, timeout=30) as server:
+        server.login(gmail_address, gmail_app_password)
+        server.send_message(msg)
+
+
 # --- doctor ---
 
 def doctor() -> None:
@@ -827,29 +900,31 @@ def doctor() -> None:
             print(f"[{'warn' if warn else 'FAIL'}] {label}" + (f" — {fix}" if fix else ""))
             failures += 0 if warn else 1
 
-    check(sys.version_info >= (3, 9), f"python {platform.python_version()}", "need Python 3.9+")
-
-    has_playwright = importlib.util.find_spec("playwright") is not None
-    check(has_playwright, "playwright installed", "run: python3 -m pip install playwright")
-
-    if has_playwright:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            chromium_ok = Path(p.chromium.executable_path).exists()
-        check(chromium_ok, "playwright chromium browser", "run: python3 -m playwright install chromium")
+    check(sys.version_info >= (3, 9), f"python {platform.python_version()} ({sys.executable})", "need Python 3.9+")
+    check(
+        not TLS_SUSPECT,
+        f"python network library ({ssl.OPENSSL_VERSION})",
+        "ClassPass's bot protection blocks this one (T-Mobile still answers it). For ClassPass, use a Python built"
+        " on OpenSSL 3: run `brew install python` (or install from python.org) and rerun with that python3",
+        warn=True,
+    )
 
     is_macos = platform.system() == "Darwin"
     check(
         is_macos,
-        "macOS (needed for Chrome cookie access and keychain)",
-        "T-Mobile fetch and keychain password storage only work on macOS",
+        "macOS (needed for Chrome cookie access, keychain and scheduling)",
+        "automatic T-Mobile/ClassPass fetching, keychain password storage and scheduled runs only work on macOS",
         warn=True,
     )
     check(
-        _chrome_cookie_db() is not None,
-        f"Chrome profile at {CHROME_PROFILE}",
-        "needed for T-Mobile; set RECEIPTS_CHROME_PROFILE if your profile is elsewhere",
+        CHROME_BINARY.exists(),
+        f"Google Chrome at {CHROME_BINARY}",
+        "install Google Chrome (https://www.google.com/chrome/), or set RECEIPTS_CHROME_BIN if it's elsewhere",
+    )
+    check(
+        bool(_chrome_cookie_dbs()),
+        f"Chrome profile under {CHROME_PROFILE or CHROME_DIR}",
+        "open Chrome once and log in to your providers; set RECEIPTS_CHROME_PROFILE if your profile is elsewhere",
         warn=True,
     )
 
@@ -875,8 +950,8 @@ def doctor() -> None:
         )
     else:
         fix = (
-            "create one at https://myaccount.google.com/apppasswords, then run:"
-            " receipts.py config --set-app-password (in your own terminal)"
+            f"create one at {APP_PASSWORD_URL}, then run: receipts.py config --set-app-password --dialog"
+            " (a hidden-input macOS dialog; or omit --dialog in your own terminal)"
         )
     check(password is not None, "gmail app password (env GMAIL_APP_PASSWORD or macOS keychain)", fix)
 
@@ -885,7 +960,7 @@ def doctor() -> None:
         check(
             error is None,
             "gmail login (no email sent)",
-            f"{error} — check the address, or create a new app password at https://myaccount.google.com/apppasswords",
+            f"{error} — check the address, or create a new app password at {APP_PASSWORD_URL}",
         )
 
     if failures:
@@ -894,6 +969,29 @@ def doctor() -> None:
 
 
 # --- config ---
+
+APP_PASSWORD_DIALOG = (
+    "activate\n"
+    'set answer to display dialog ("Paste your Gmail app password (16 letters)." & return & return'
+    ' & "It goes straight into your macOS keychain. Need one? Click Create one'
+    ' (your Google account needs 2-Step Verification).")'
+    ' default answer "" with hidden answer with title "Emburse receipts"'
+    ' buttons {"Cancel", "Create one", "Save"} default button "Save" cancel button "Cancel"\n'
+    "return (button returned of answer) & linefeed & (text returned of answer)"
+)
+
+
+def app_password_dialog() -> str:
+    """Hidden-input macOS dialog, so the password never passes through a terminal or a chat."""
+    while True:
+        result = subprocess.run(["osascript", "-e", APP_PASSWORD_DIALOG], capture_output=True, text=True)
+        button, _, password = result.stdout.rstrip("\n").partition("\n")
+        if result.returncode != 0 or button not in ("Save", "Create one"):
+            return ""
+        if button == "Save":
+            return "".join(password.split())
+        subprocess.run(["open", APP_PASSWORD_URL], check=False)
+
 
 def configure(args: argparse.Namespace) -> None:
     config = load_config()
@@ -905,7 +1003,10 @@ def configure(args: argparse.Namespace) -> None:
         config["auto_since"] = args.auto_since
     if args.auto_providers:
         config["auto_providers"] = args.auto_providers
-    if args.send_to or args.gmail_address or args.auto_since or args.auto_providers:
+    if args.claude_fallback:
+        config["claude_fallback"] = args.claude_fallback == "on"
+    changed = args.send_to or args.gmail_address or args.auto_since or args.auto_providers or args.claude_fallback
+    if changed:
         save_config(config)
         print(f"Saved {CONFIG_PATH}")
 
@@ -914,6 +1015,8 @@ def configure(args: argparse.Namespace) -> None:
             sys.exit("Keychain storage requires macOS. Set GMAIL_APP_PASSWORD in your shell profile instead.")
         if args.from_env:
             password = os.environ.get("GMAIL_APP_PASSWORD", "")
+        elif args.dialog:
+            password = app_password_dialog()
         elif sys.stdin.isatty():
             password = getpass.getpass("Gmail app password (input hidden): ")
         else:
@@ -930,9 +1033,7 @@ def configure(args: argparse.Namespace) -> None:
             error = verify_gmail_login(account, password)
             print(f"WARNING: {error}." if error else "Verified: Gmail accepts it.")
 
-    if args.show or not (
-        args.send_to or args.gmail_address or args.auto_since or args.auto_providers or args.set_app_password
-    ):
+    if args.show or not (changed or args.set_app_password):
         print(json.dumps(load_config(), indent=2))
         print(f"app password: {'set' if get_gmail_app_password() else 'unset'}")
 
@@ -968,11 +1069,13 @@ def status(args: argparse.Namespace) -> None:
         print("Nothing fetched or sent yet.")
         return
 
-    this_month = datetime.today().strftime("%Y-%m")
-    first = {p: min([m for k, m in known if k == p] or [this_month]) for p in providers}
+    current = this_month()
+    first = {p: min([m for k, m in known if k == p] or [current]) for p in providers}
     month = args.since or min(first.values())
-    rows, pending = [], {p: [] for p in providers}
-    while month <= this_month:
+    # Months the scheduled job deliberately leaves alone aren't "missing".
+    auto_since, auto_skip = (None if args.since else get_auto_since()), get_auto_skip()
+    rows, pending, left_alone = [], {p: [] for p in providers}, {p: [] for p in providers}
+    while month <= current:
         cells = []
         for provider in providers:
             entry = log.get(f"{provider}/{month}")
@@ -981,6 +1084,9 @@ def status(args: argparse.Namespace) -> None:
                 cells.append(f"sent {entry['sent_at'][:10]}" + (f" (x{repeat + 1})" if repeat else ""))
             elif month < first[provider] and not args.since:
                 cells.append("-")
+            elif f"{provider}/{month}" in auto_skip or (auto_since and month < auto_since):
+                cells.append("not sent (left alone)")
+                left_alone[provider].append(month)
             else:
                 cells.append("fetched, not sent" if (provider, month) in fetched else "NOT SENT")
                 pending[provider].append(month)
@@ -999,6 +1105,14 @@ def status(args: argparse.Namespace) -> None:
             print(f"  {provider}: {','.join(months)}")
     else:
         print("\nEverything is sent.")
+    if any(left_alone.values()):
+        print(
+            f"\nLeft alone (before auto_since {get_auto_since()} or in auto_skip; send them yourself with"
+            " fetch ... --send if you want them):"
+        )
+        for provider, months in left_alone.items():
+            if months:
+                print(f"  {provider}: {','.join(months)}")
 
 
 # --- fetch ---
@@ -1030,8 +1144,15 @@ def deliver(ready: list, errors: dict, force: bool = False) -> tuple[list, list]
     """Email each ready receipt unless it's a dupe; returns ([(provider, month) sent], [(provider, month) skipped])."""
     sent, skipped = [], []
     sent_log = load_sent_log()
+    keys = [(provider, month) for provider, month, _, _ in ready]
     for provider, month, pdf_path, info in ready:
         label = PROVIDERS[provider]
+        if keys.count((provider, month)) > 1:
+            # Both were saved to the same file, so sending either could attach the wrong receipt (twice).
+            problem = "more than one receipt for this month in one batch, so none was sent; fetch the right one alone with --url"
+            if month not in errors.get((label, problem), []):
+                _fail(errors, provider, month, problem)
+            continue
         duplicate = sent_elsewhere(provider, month, info, sent_log)
         if duplicate:
             _fail(errors, provider, month, f"BLOCKED — this exact receipt was already sent as {duplicate}")
@@ -1106,9 +1227,8 @@ def _fetch(args: argparse.Namespace) -> None:
     errors: dict = {}
 
     if args.url:
-        with stripe_page() as page:
-            for number, url in enumerate(args.url, 1):
-                _attempt(ready, errors, "classpass", f"URL #{number}", lambda: render_stripe_receipt(page, url, args.month))
+        for number, url in enumerate(args.url, 1):
+            _attempt(ready, errors, "classpass", f"URL #{number}", lambda: render_stripe_receipt(url, args.month))
     elif args.pdf:
         provider, month = providers[0], months[0]
         _attempt(ready, errors, provider, month, lambda: (month, *import_pdf(provider, month, args.pdf)))
@@ -1147,6 +1267,11 @@ def claude_binary() -> str | None:
     return os.environ.get("RECEIPTS_CLAUDE_BIN") or shutil.which("claude")
 
 
+def claude_fallback_enabled() -> bool:
+    """Off unless switched on with `config --claude-fallback on`: it lets an AI agent drive the user's Chrome unattended."""
+    return bool(load_config().get("claude_fallback")) and claude_binary() is not None
+
+
 def collect_stripe_urls(months: list[str]) -> list[str]:
     """Ask Claude in Chrome (headless `claude -p`) for the Stripe receipt URLs of ClassPass charges."""
     claude = claude_binary()
@@ -1169,7 +1294,9 @@ def collect_stripe_urls(months: list[str]) -> list[str]:
         raise ReceiptError(f"couldn't run claude: {error}")
 
     stdout, stderr = result.stdout or "", result.stderr or ""
-    print(f"Claude in Chrome output: {stdout.strip()[:2000]}", flush=True)
+    # Stripe receipt links work for anyone who has them, so they stay out of the log.
+    redacted = re.sub(r"(https://pay\.stripe\.com/receipts/)\S+", r"\1<redacted>", stdout.strip())
+    print(f"Claude in Chrome output: {redacted[:2000]}", flush=True)
     combined = stdout + stderr
     if "Failed to authenticate" in combined or "OAuth" in combined:
         raise ReceiptError(
@@ -1198,16 +1325,68 @@ def notify(message: str) -> None:
         pass
 
 
-def pending_receipts(log: dict) -> list[tuple[str, str]]:
-    since, last = get_auto_since(), previous_month()
-    months = parse_months(f"{since}..{last}") if since <= last else []
-    skip = set(load_config().get("auto_skip") or [])
-    return [
-        (provider, month)
-        for provider in get_auto_providers()
-        for month in months
-        if f"{provider}/{month}" not in log and f"{provider}/{month}" not in skip
-    ]
+def alert(state: dict, problems: str) -> None:
+    """Notify, and email the details too — at most once a week while the same problems persist."""
+    notify(f"Needs attention: {problems.splitlines()[0]} (see {RUN_LOG})"[:250])
+    digest = hashlib.sha256(problems.encode()).hexdigest()[:16]
+    last = state.get("last_alert") or {}
+    if last.get("digest") == digest and datetime.now() - datetime.fromisoformat(last["at"]) < ALERT_EMAIL_INTERVAL:
+        return
+    try:
+        send_alert_email(problems)
+    except (ReceiptError, smtplib.SMTPException, OSError) as error:
+        print(f"(Couldn't email the alert: {error})")
+        return
+    print(f"Emailed the problem list to {get_gmail_address()}.")
+    state["last_alert"] = {"digest": digest, "at": datetime.now().isoformat(timespec="seconds")}
+
+
+def expected_day(provider: str) -> int | None:
+    """Day of the month this provider's receipt usually appears, going by the latest one fetched."""
+    dated = {
+        key: entry["date"]
+        for key, entry in read_json(MANIFEST_PATH).items()
+        if key.startswith(f"{provider}/") and entry.get("date")
+    }
+    return int(dated[max(dated)][8:10]) if dated else None
+
+
+def pending_receipts(log: dict, today: datetime | None = None) -> tuple[list[tuple[str, str]], list[tuple[str, str, int]]]:
+    """Unsent receipts since auto_since: ([(provider, month)] due now, [(provider, month, day)] not expected yet).
+
+    The current month is due once the provider's usual issue day has come (right away if that's unknown).
+    """
+    today = today or datetime.today()
+    since, current = get_auto_since(), today.strftime("%Y-%m")
+    last_day = calendar.monthrange(today.year, today.month)[1]
+    skip = get_auto_skip()
+    due, waiting = [], []
+    for provider in get_auto_providers():
+        day = expected_day(provider)
+        for month in parse_months(f"{since}..{current}") if since <= current else []:
+            if f"{provider}/{month}" in log or f"{provider}/{month}" in skip:
+                continue
+            if month < current:
+                due.append((provider, month))
+            elif provider not in CURRENT_MONTH_PROVIDERS:
+                continue
+            elif day and today.day < min(day, last_day):
+                waiting.append((provider, month, day))
+            else:
+                due.append((provider, month))
+    return due, waiting
+
+
+def _describe_waiting(waiting: list) -> str:
+    return "; ".join(f"{PROVIDERS[p]} {month_label(m)} (usually issued around day {day})" for p, m, day in waiting)
+
+
+def _report(errors: dict, provider: str, month: str, problem: str) -> None:
+    """Record a failed fetch — unless the current month's bill/charge just doesn't exist yet; the next run retries."""
+    if month == this_month() and (TMOBILE_NO_BILL in problem or CLASSPASS_NO_CHARGE in problem):
+        print(f"{PROVIDERS[provider]} {month_label(month)}: not issued yet; the next run retries.")
+    else:
+        _fail(errors, provider, month, problem)
 
 
 def _fetch_with_retry(
@@ -1243,7 +1422,7 @@ def _fetch_tmobile(months: list[str], send: bool, ready: list, errors: dict) -> 
         "tmobile", months, send, ready, tmobile_pdf, TMOBILE_REJECTED, TMOBILE_LOGIN_URL, _tmobile_session
     )
     for month, problem in failures.items():
-        _fail(errors, "tmobile", month, problem)
+        _report(errors, "tmobile", month, problem)
 
 
 def _fetch_classpass(months: list[str], send: bool, ready: list, errors: dict) -> list[str]:
@@ -1251,12 +1430,16 @@ def _fetch_classpass(months: list[str], send: bool, ready: list, errors: dict) -
     failures = _fetch_with_retry(
         "classpass", months, send, ready, classpass_pdf, CLASSPASS_REJECTED, CLASSPASS_CHARGES_URL, _classpass_session
     )
-    fallback = [month for month, problem in failures.items() if CLASSPASS_NO_CHARGE not in problem]
+    fallback = [
+        month
+        for month, problem in failures.items()
+        if claude_fallback_enabled() and not any(marker in problem for marker in CLASSPASS_NO_FALLBACK)
+    ]
     for month, problem in failures.items():
-        if month not in fallback or not (send and claude_binary()):
-            _fail(errors, "classpass", month, problem)
-    if not (send and fallback and claude_binary()):
-        return fallback if claude_binary() else []
+        if month not in fallback or not send:
+            _report(errors, "classpass", month, problem)
+    if not (send and fallback):
+        return fallback
 
     try:
         urls = collect_stripe_urls(fallback)
@@ -1265,9 +1448,8 @@ def _fetch_classpass(months: list[str], send: bool, ready: list, errors: dict) -
             _fail(errors, "classpass", month, f"{failures[month]} Claude in Chrome fallback also failed: {error}")
         return fallback
     before = len(ready)
-    with stripe_page() as page:
-        for number, url in enumerate(urls, 1):
-            _attempt(ready, errors, "classpass", f"URL #{number}", lambda: render_stripe_receipt(page, url, fallback))
+    for number, url in enumerate(urls, 1):
+        _attempt(ready, errors, "classpass", f"URL #{number}", lambda: render_stripe_receipt(url, fallback))
     got = {item[1] for item in ready[before:]}
     for month in fallback:
         if month not in got:
@@ -1321,21 +1503,34 @@ def refresh_from_plugin(state: dict) -> None:
     os.execv(sys.executable, [sys.executable, str(INSTALLED_SCRIPT), *sys.argv[1:]])
 
 
+def secure_log() -> None:
+    """The log names accounts and receipts; keep it readable by the user only."""
+    try:
+        RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+        RUN_LOG.touch(exist_ok=True)
+        os.chmod(RUN_LOG, 0o600)
+    except OSError:
+        pass
+
+
 def auto(args: argparse.Namespace) -> None:
     state = read_json(AUTO_STATE_PATH)
     if args.send:
+        secure_log()
         print(f"=== auto --send {datetime.now():%Y-%m-%d %H:%M} ===", flush=True)
         refresh_from_plugin(state)
-    if args.send and not args.now and state.get("last_success"):
-        last = datetime.fromisoformat(state["last_success"])
-        due = last + AUTO_INTERVAL
-        if datetime.now() < due:
-            print(f"Last successful run: {last:%Y-%m-%d %H:%M}. Next due: {due:%Y-%m-%d} (use --now to run anyway).")
+    if not get_auto_since():
+        sys.exit("auto_since isn't set. Run: receipts.py config --auto-since YYYY-MM (earliest month to submit)")
+    if args.send and not args.now:
+        # Daily runs are cheap: going by the local send log, most days there's nothing to do (and no network use).
+        due, waiting = pending_receipts(load_sent_log())
+        if not due:
+            print("Nothing due." + (f" Not expected yet: {_describe_waiting(waiting)}." if waiting else ""))
+            state["last_run"] = state["last_success"] = datetime.now().isoformat(timespec="seconds")
+            write_json(AUTO_STATE_PATH, state)
             return
     if args.send:
         wait_for_network()
-    if not get_auto_since():
-        sys.exit("auto_since isn't set. Run: receipts.py config --auto-since YYYY-MM (earliest month to submit)")
 
     try:
         with run_lock():
@@ -1368,18 +1563,21 @@ def _auto_run(args: argparse.Namespace, state: dict) -> bool:
             notify(f"Needs attention: {problem} (see {RUN_LOG})")
         return finish(False)
 
-    pending = pending_receipts(load_sent_log())
-    since, last = get_auto_since(), previous_month()
-    print(f"Auto providers: {', '.join(get_auto_providers())}; months {since} through {last}.")
-    if not pending:
-        print("Nothing pending.")
+    due, waiting = pending_receipts(load_sent_log())
+    if args.now:
+        due, waiting = due + [(provider, month) for provider, month, _ in waiting], []
+    print(f"Auto providers: {', '.join(get_auto_providers())}; months {get_auto_since()} through {this_month()}.")
+    if waiting:
+        print(f"Not expected yet (--now tries anyway): {_describe_waiting(waiting)}")
+    if not due:
+        print("Nothing due.")
         return finish(True)
-    print("Pending: " + "; ".join(f"{PROVIDERS[p]} {m}" for p, m in pending))
+    print("Due: " + "; ".join(f"{PROVIDERS[p]} {m}" for p, m in due))
 
     ready: list = []
     need_browser: list[str] = []
     for provider in get_auto_providers():
-        months = [m for p, m in pending if p == provider]
+        months = [m for p, m in due if p == provider]
         if not months:
             continue
         if provider == "tmobile":
@@ -1406,29 +1604,26 @@ def _auto_run(args: argparse.Namespace, state: dict) -> bool:
     sent, _ = deliver(ready, errors)
     if errors:
         print_problems(errors)
-    remaining = [item for item in pending if f"{item[0]}/{item[1]}" not in load_sent_log()]
     if sent:
         notify(f"Sent: {_describe_sent(sent)}")
     if errors:
-        (label, problem), whats = next(iter(errors.items()))
-        notify(f"Needs attention: {label} {', '.join(whats)}: {problem} (see {RUN_LOG})"[:250])
-    return finish(not errors and not remaining)
+        alert(state, "\n".join(f"{label} {', '.join(whats)}: {problem}" for (label, problem), whats in errors.items()))
+    return finish(not errors)
 
 
 # --- schedule (macOS launchd) ---
 
-def ensure_venv() -> Path:
-    """A private venv with Playwright, so scheduled runs don't depend on the system Python's packages."""
-    python = VENV_DIR / "bin" / "python"
-    if not python.exists():
-        print(f"Creating {VENV_DIR}...")
-        subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
-    if subprocess.run([str(python), "-c", "import playwright"], stderr=subprocess.DEVNULL).returncode != 0:
-        requirements = Path(__file__).resolve().parent.parent / "requirements.txt"
-        spec = ["-r", str(requirements)] if requirements.exists() else ["playwright>=1.40.0"]
-        subprocess.run([str(python), "-m", "pip", "install", *spec], check=True)
-    subprocess.run([str(python), "-m", "playwright", "install", "chromium"], check=True)
-    return python
+def scheduler_python() -> str:
+    """The Python for scheduled runs: this one, unless ClassPass would block it and a better one is installed."""
+    if not TLS_SUSPECT:
+        return sys.executable
+    probe = "import ssl, sys; sys.exit('LibreSSL' in ssl.OPENSSL_VERSION or sys.version_info < (3, 9))"
+    for candidate in (shutil.which("python3"), "/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+        # /usr/bin/python3 is the system LibreSSL build (or, without the Command Line Tools, an installer stub).
+        if candidate and candidate != "/usr/bin/python3" and Path(candidate).exists():
+            if subprocess.run([candidate, "-c", probe], capture_output=True).returncode == 0:
+                return candidate
+    return sys.executable
 
 
 def install_script(source: Path, destination: Path = INSTALLED_SCRIPT) -> Path:
@@ -1441,7 +1636,7 @@ def install_script(source: Path, destination: Path = INSTALLED_SCRIPT) -> Path:
     return destination
 
 
-def build_plist(venv_python: Path, script: Path, claude: str | None, log_path: Path, receipts_home: str | None) -> bytes:
+def build_plist(python: str, script: Path, claude: str | None, log_path: Path, receipts_home: str | None) -> bytes:
     environment = {
         "PATH": ":".join(([str(Path(claude).parent)] if claude else []) + ["/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]),
         "PYTHONUNBUFFERED": "1",
@@ -1453,7 +1648,7 @@ def build_plist(venv_python: Path, script: Path, claude: str | None, log_path: P
     return plistlib.dumps(
         {
             "Label": LAUNCH_LABEL,
-            "ProgramArguments": [str(venv_python), str(script), "auto", "--send"],
+            "ProgramArguments": [python, str(script), "auto", "--send"],
             "StartCalendarInterval": {"Hour": 10, "Minute": 0},
             "RunAtLoad": True,
             "StandardOutPath": str(log_path),
@@ -1474,12 +1669,8 @@ def schedule(args: argparse.Namespace) -> None:
 
     if args.action == "install":
         claude = claude_binary()
-        if not claude:
-            print("claude CLI not found: ClassPass will use only your Chrome session (no Claude in Chrome fallback)")
-        try:
-            python = ensure_venv()
-        except subprocess.CalledProcessError as error:
-            sys.exit(f"couldn't set up {VENV_DIR}: {error}")
+        if load_config().get("claude_fallback") and not claude:
+            print("claude CLI not found: the Claude in Chrome fallback for ClassPass is on in the config but can't run")
         LAUNCH_PLIST.parent.mkdir(parents=True, exist_ok=True)
         script = install_script(Path(__file__).resolve())
         plugin = plugin_script()
@@ -1487,15 +1678,19 @@ def schedule(args: argparse.Namespace) -> None:
             state = read_json(AUTO_STATE_PATH)
             state["plugin_script_sha256"] = sha256_file(plugin)
             write_json(AUTO_STATE_PATH, state)
-        LAUNCH_PLIST.write_bytes(build_plist(python, script, claude, RUN_LOG, os.environ.get("RECEIPTS_HOME")))
+        secure_log()
+        LAUNCH_PLIST.write_bytes(
+            build_plist(scheduler_python(), script, claude, RUN_LOG, os.environ.get("RECEIPTS_HOME"))
+        )
         _launchctl("bootout", target)
         result = _launchctl("bootstrap", f"gui/{os.getuid()}", str(LAUNCH_PLIST))
         if result.returncode != 0:
             sys.exit(f"launchctl bootstrap failed: {result.stderr.strip()}")
         print(f"Installed {LAUNCH_PLIST}")
         print(
-            "It runs now (RunAtLoad), then daily at 10:00 and at each login; each run is skipped unless the last"
-            f" successful run was 14+ days ago. Logs: {RUN_LOG}"
+            "It runs now (RunAtLoad), then daily at 10:00 and at each login. A run sends whatever is due: unsent"
+            " past months, plus this month's receipt once its usual issue day has come. Problems are reported by"
+            f" notification and by email to yourself. Logs: {RUN_LOG}"
         )
     elif args.action == "uninstall":
         _launchctl("bootout", target)
@@ -1507,6 +1702,9 @@ def schedule(args: argparse.Namespace) -> None:
         print(f"Agent: {'loaded' if loaded else 'not loaded'} ({LAUNCH_LABEL})")
         print(f"Plist: {LAUNCH_PLIST} ({'exists' if LAUNCH_PLIST.exists() else 'missing'})")
         print(f"Script: {INSTALLED_SCRIPT} ({'exists' if INSTALLED_SCRIPT.exists() else 'missing'})")
+        if LAUNCH_PLIST.exists():
+            python = plistlib.loads(LAUNCH_PLIST.read_bytes())["ProgramArguments"][0]
+            print(f"Python: {python} ({'exists' if Path(python).exists() else 'MISSING: rerun schedule install'})")
         plugin = plugin_script()
         if not plugin:
             print("Plugin script: not found")
@@ -1515,10 +1713,15 @@ def schedule(args: argparse.Namespace) -> None:
             print(f"Plugin script: {plugin} ({'matches' if same else 'differs from'} the scheduled copy)")
         print(f"Last run: {state.get('last_run', 'never')}")
         print(f"Last success: {state.get('last_success', 'never')}")
-        if state.get("last_success"):
-            print(f"Next due: {(datetime.fromisoformat(state['last_success']) + AUTO_INTERVAL):%Y-%m-%d}")
+        print("Checks: daily at 10:00 and at login")
+        if get_auto_since():
+            due, waiting = pending_receipts(load_sent_log())
+            print("Due now: " + ("; ".join(f"{PROVIDERS[p]} {m}" for p, m in due) or "nothing"))
+            if waiting:
+                print(f"Not expected yet: {_describe_waiting(waiting)}")
         else:
-            print("Next due: next scheduled run")
+            print("auto_since: unset (run: receipts.py config --auto-since YYYY-MM)")
+        print(f"Claude in Chrome fallback for ClassPass: {'on' if claude_fallback_enabled() else 'off'}")
 
 
 def main() -> None:
@@ -1573,6 +1776,17 @@ def main() -> None:
         action="store_true",
         help="with --set-app-password: take it from $GMAIL_APP_PASSWORD instead of prompting",
     )
+    config_parser.add_argument(
+        "--dialog",
+        action="store_true",
+        help="with --set-app-password: ask in a hidden-input macOS dialog (works without a terminal)",
+    )
+    config_parser.add_argument(
+        "--claude-fallback",
+        choices=["on", "off"],
+        help="scheduled runs: if the ClassPass API method breaks, let `claude -p --chrome` drive your Chrome"
+        " to find the receipt links (default: off)",
+    )
     config_parser.add_argument("--auto-since", type=parse_month, help="earliest month `auto` may submit (YYYY-MM)")
     config_parser.add_argument(
         "--auto-providers",
@@ -1582,9 +1796,9 @@ def main() -> None:
     config_parser.add_argument("--show", action="store_true", help="print current config")
     config_parser.set_defaults(func=configure)
 
-    auto_parser = sub.add_parser("auto", help="unattended: fetch and send every pending month (see config --auto-since)")
-    auto_parser.add_argument("--send", action="store_true", help="actually fetch via the browser and email (default: print the plan)")
-    auto_parser.add_argument("--now", action="store_true", help="with --send: ignore the 14-day gate since the last success")
+    auto_parser = sub.add_parser("auto", help="unattended: fetch and send every receipt that's due (see config --auto-since)")
+    auto_parser.add_argument("--send", action="store_true", help="actually email what's due (default: print the plan)")
+    auto_parser.add_argument("--now", action="store_true", help="also try this month's receipts before their usual issue day")
     auto_parser.set_defaults(func=auto)
 
     schedule_parser = sub.add_parser("schedule", help="install/remove the macOS launchd agent that runs `auto --send`")
